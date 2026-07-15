@@ -1,0 +1,20 @@
+repos:
+  - repo: local
+    hooks:
+      - id: js-ts-format
+        name: JS/TS format
+        entry: pnpm format:check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: js-ts-lint
+        name: JS/TS lint
+        entry: pnpm lint
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: check-commit-message
+        name: check commit message
+        entry: bash scripts/check-commit-message.sh
+        language: system
+        stages: [commit-msg]
