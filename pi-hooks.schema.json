@@ -1,0 +1,219 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://schemas.local/pi-hooks.schema.json",
+    "title": "Pi Hooks Configuration",
+    "description": "Schema for hooks.json files used by Pi Hooks, based on Pi lifecycle events and handlers.",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+        "hooks"
+    ],
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "Optional editor schema reference."
+        },
+        "description": {
+            "type": "string",
+            "description": "Optional human-readable description of this hooks file."
+        },
+        "hooks": {
+            "type": "object",
+            "description": "Hook event registrations grouped by Pi lifecycle event.",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+                "project_trust": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi evaluates project trust."
+                },
+                "resources_discover": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi gathers extra resource paths after session start."
+                },
+                "session_start": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when a Pi session starts."
+                },
+                "session_info_changed": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when session metadata changes."
+                },
+                "session_before_switch": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before Pi switches sessions."
+                },
+                "session_before_fork": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before Pi forks a session."
+                },
+                "session_before_compact": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before Pi compacts the current session."
+                },
+                "session_compact": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi compaction completes."
+                },
+                "session_shutdown": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi is shutting down."
+                },
+                "session_before_tree": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before Pi prepares a session tree view."
+                },
+                "session_tree": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi renders or updates a session tree view."
+                },
+                "context": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi derives the current context state."
+                },
+                "before_provider_request": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before Pi sends a provider request."
+                },
+                "before_provider_headers": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before Pi finalizes provider request headers."
+                },
+                "after_provider_response": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs after Pi receives a provider response."
+                },
+                "before_agent_start": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs before an agent starts processing."
+                },
+                "agent_start": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when an agent starts."
+                },
+                "agent_end": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when an agent ends."
+                },
+                "agent_settled": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when an agent has settled after work completes."
+                },
+                "turn_start": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when a new turn starts."
+                },
+                "turn_end": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when a turn ends."
+                },
+                "message_start": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when a message starts streaming."
+                },
+                "message_update": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs while a message continues streaming."
+                },
+                "message_end": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when a message finishes streaming."
+                },
+                "tool_execution_start": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi starts executing a tool."
+                },
+                "tool_execution_update": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs while Pi is updating tool execution progress."
+                },
+                "tool_execution_end": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi finishes executing a tool."
+                },
+                "model_select": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi selects a model."
+                },
+                "thinking_level_select": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi selects a thinking level."
+                },
+                "tool_call": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when the agent calls a tool."
+                },
+                "tool_result": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when a tool returns a result."
+                },
+                "user_bash": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when the user asks Pi to run a bash command."
+                },
+                "input": {
+                    "$ref": "#/$defs/matcherGroups",
+                    "description": "Runs when Pi receives raw input."
+                }
+            }
+        }
+    },
+    "$defs": {
+        "matcherGroups": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "$ref": "#/$defs/matcherGroup"
+            }
+        },
+        "matcherGroup": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "hooks"
+            ],
+            "properties": {
+                "matcher": {
+                    "type": "string",
+                    "description": "Regex string that filters when a matcher group fires. Use *, an empty string, or omit matcher to match broadly."
+                },
+                "hooks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Handlers to run when this matcher group matches.",
+                    "items": {
+                        "$ref": "#/$defs/handler"
+                    }
+                }
+            }
+        },
+        "handler": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+                "type",
+                "command"
+            ],
+            "properties": {
+                "type": {
+                    "const": "command",
+                    "description": "Only command handlers are supported by Pi Hooks."
+                },
+                "command": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Command to execute with the Pi session working directory as cwd."
+                },
+                "timeout": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Timeout in seconds."
+                },
+                "statusMessage": {
+                    "type": "string",
+                    "description": "Optional status text shown while the handler runs."
+                }
+            }
+        }
+    }
+}

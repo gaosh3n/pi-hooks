@@ -1,0 +1,18 @@
+{
+    "$schema": "https://raw.githubusercontent.com/gaosh3n/pi-hooks/main/pi-hooks.schema.json",
+    "hooks": {
+        "tool_execution_end": [
+            {
+                "matcher": "^(edit|write)$",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "",
+                        "timeout": 30,
+                        "statusMessage": "JS/TS quality enforcement"
+                    }
+                ]
+            }
+        ]
+    }
+}
