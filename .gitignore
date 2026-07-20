@@ -3,3 +3,7 @@ dist/
 coverage/
 *.tsbuildinfo
 .DS_Store
+
+# Pi coding agent
+.pi-subagents/
+
