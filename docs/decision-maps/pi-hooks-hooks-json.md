@@ -42,14 +42,13 @@ Type: Research
 
 ### Question
 
-How should Pi discover hooks files across global/user/project-local layers ?
+How should Pi discover hooks files across global/user/project-local layers?
 
 ### Answer
 
 Resolved. See:
 
 - `docs/research/codex-hooks-findings.md`
-- `docs/research/codex-hooks-merge.showboat.md`
 
 Codex’s merge behavior is still useful as reference:
 
@@ -81,55 +80,78 @@ Type: Research
 
 ### Question
 
-Once `hooks.json` files are discovered, how should Pi load them into an executable in-memory form, following Codex CLI’s loading approach but adapted to Pi?
+Once `hooks.json` files are discovered, how should Pi normalize them into an in-memory form for the Pi Hooks extension, while preserving all Pi-native event support?
 
 ### Answer
 
 Resolved. See:
+
 - `docs/research/codex-hooks-findings.md`
-- `docs/research/codex-hooks-merge.showboat.md`
 
 Settled policy:
+
 - discovery implies enabled; there is no separate enable/disable layer for now
 - `hooks.json` is the only config format
-- loading should follow Codex’s post-discovery shape: parse each discovered file, normalize handlers into runtime entries once, and build one in-memory registry in discovery order
+- loading should parse each discovered file, normalize handlers once, and build one in-memory registry in discovery order
+- all Pi-native events allowed by the schema are preserved; this decision map does not choose a subset of events
 
 Codex taught three distinct loading stages that Pi should mirror:
 
 1. **Parse file**
-   - read `hooks.json`
-   - validate/parse it with `pi-hooks.schema.json`
-   - ignore empty hook files
+    - read `hooks.json`
+    - validate/parse it with `pi-hooks.schema.json`
+    - ignore empty hook files
 
 2. **Normalize handlers**
-   - iterate event buckets in schema-defined order
-   - iterate matcher groups in file order
-   - iterate handlers in group order
-   - normalize each handler into an internal runtime record containing at least:
-     - source file path
-     - event name
-     - handler type (`command`)
-     - command string
-     - normalized timeout
-     - matcher metadata
-     - stable display order
-   - apply loader-time checks here, not during dispatch:
-     - reject malformed file data via schema
-     - reject invalid regex matchers cleanly
-     - normalize/default timeout
-     - preserve exact configured order
+    - iterate event buckets in file/schema order
+    - iterate matcher groups in file order
+    - iterate handlers in group order
+    - normalize each handler into an internal runtime record containing at least:
+        - source file path
+        - event name
+        - handler type (`command`)
+        - command string
+        - normalized timeout
+        - matcher metadata
+        - stable display order
+    - apply loader-time checks here, not later:
+        - reject malformed file data via schema
+        - reject invalid regex matchers cleanly
+        - normalize/default timeout
+        - preserve exact configured order
 
 3. **Build registry**
-   - append normalized handlers from each discovered file into one registry in discovery order
-   - deduplicate only at the exact file-path level, not by event or command content
-   - keep this registry separate from later runtime dispatch
+    - append normalized handlers from each discovered file into one registry in discovery order
+    - deduplicate only at the exact file-path level, not by event or command content
+    - keep this registry separate from later runtime use
 
-Important Codex lesson: loading and execution are separate concerns. Codex first builds a normalized `ConfiguredHandler` list, then later filters it by event name + matcher at runtime. Pi should do the same in TypeScript: one loader pass, one registry, then runtime selection/execution against that registry.
+Important Codex lesson: loading and later use are separate concerns. Codex first builds a normalized handler list, then later filters it at runtime. Pi should do the same in TypeScript: one loader pass, one registry, then later Pi event handling against that registry.
 
 So for Pi, “load hooks after discovery” means:
+
 - parse `hooks.json`
 - normalize every handler once
 - store them in one ordered in-memory registry
-- let the runtime consume that registry later
+- let the Pi extension consume that registry later
 
 With those decisions made, the path to implementation is now clear enough that no further decision-map tickets are required.
+
+## #4: What should happen when a discovered `hooks.json` is malformed or partially invalid?
+
+Blocked by: #1, #2, #3
+Type: Discuss
+
+### Question
+
+When Pi discovers a `hooks.json` that fails validation or contains invalid entries, should it skip the whole file, skip only invalid handlers, or surface a hard error? What should users see?
+
+### Answer
+
+Resolved.
+
+Loader behavior should be split into two cases:
+
+- **Malformed `hooks.json` file**: warn clearly and skip the whole file.
+- **Partially invalid entries inside a valid file**: skip only the bad handler/group entry, keep the rest of the file, and warn clearly.
+
+That matches Codex’s behavior: JSON parse failures are treated as startup warnings and prevent the file from loading, while invalid matchers, unsupported async hooks, empty commands, and unsupported handler types are skipped individually during normalization.

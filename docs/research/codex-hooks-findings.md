@@ -1,5 +1,7 @@
 # Codex hooks findings for `pi-hooks`
 
+This note consolidates the former `codex-hooks-merge.showboat.md` research into one place.
+
 ## Sources inspected
 
 `root-directory` represents the root directory of Codex source code.
@@ -14,6 +16,132 @@
 - `<root-directory>/codex-rs/core/src/session/mod.rs`
 - `<root-directory>/codex-rs/core/src/config/config_loader_tests.rs`
 - Pi docs: `docs/extensions.md`
+
+## Discovery / merge order
+
+Codex discovers hooks in `discover_handlers()`:
+
+- processes config layers in `LowestPrecedenceFirst` order
+- remembers visited hook folders in `visited_json_hook_folders`
+- loads `hooks.json` at most once per folder
+- loads TOML hooks from the layer separately
+- appends both sources into one discovered handler stream
+
+Key source excerpt:
+
+```rust
+for layer in config_layer_stack.get_layers(
+    ConfigLayerStackOrdering::LowestPrecedenceFirst,
+    /*include_disabled*/ false,
+) {
+    let json_hooks = match layer.hooks_config_folder() {
+        Some(config_folder) if visited_json_hook_folders.insert(config_folder.clone()) => {
+            load_hooks_json(Some(config_folder.as_path()), &mut warnings)
+        }
+        _ => None,
+    };
+    let toml_hooks = load_toml_hooks_from_layer(layer, &mut warnings);
+
+    for (source_path, hook_events) in [json_hooks, toml_hooks].into_iter().flatten() {
+        append_hook_events(/* ... */);
+    }
+}
+```
+
+## `hooks.json` loading
+
+Codex loads `hooks.json` as a strict JSON file, parses it into `HooksFile`, and returns only the `hooks` payload.
+
+```rust
+fn load_hooks_json(
+    config_folder: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Option<(AbsolutePathBuf, HookEventsToml)> {
+    let source_path = config_folder?.join("hooks.json");
+    if !source_path.as_path().is_file() {
+        return None;
+    }
+
+    let contents = fs::read_to_string(source_path.as_path()).ok()?;
+    let parsed: HooksFile = serde_json::from_str(&contents).ok()?;
+    (!parsed.hooks.is_empty()).then_some((source_path, parsed.hooks))
+}
+```
+
+## Post-discovery normalization
+
+Codex does not execute raw JSON objects directly. It normalizes each handler into in-memory records while preserving source order.
+
+Normalization happens in `append_matcher_groups()`:
+
+- iterate events in fixed event order
+- iterate matcher groups in file order
+- iterate handlers in group order
+- normalize command fields
+- compute a stable positional key
+- compute display order
+- append a list entry for inspection
+- append an executable handler for runtime
+
+```rust
+let normalized_handler = HookHandlerConfig::Command {
+    command: command.clone(),
+    command_windows: None,
+    timeout_sec: Some(timeout_sec),
+    r#async,
+    status_message: status_message.clone(),
+};
+let key = crate::hook_key(&source.key_source, event_name, group_index, handler_index);
+
+hook_entries.push(HookListEntry { /* ... */ });
+handlers.push(ConfiguredHandler {
+    event_name,
+    matcher: matcher.map(ToOwned::to_owned),
+    command,
+    timeout_sec,
+    status_message,
+    source_path: source.path.clone(),
+    source: source.source,
+    display_order: *display_order,
+    env: source.env.clone(),
+});
+```
+
+Loader-time filtering / normalization includes:
+
+- `commandWindows` overrides `command` on Windows
+- unsupported async hooks are skipped
+- empty commands are skipped
+- timeout is normalized
+- env placeholders are substituted
+- matcher validity is checked before appending
+
+Codex also creates a parallel inspection record, `HookListEntry`, so the system can list discovered hooks separately from the subset that will actually execute.
+
+## Runtime boundary
+
+`ClaudeHooksEngine::new()` calls discovery once and stores the normalized handlers in memory:
+
+```rust
+let discovered = discovery::discover_handlers(
+    config_layer_stack,
+    plugin_hook_sources,
+    plugin_hook_load_warnings,
+    bypass_hook_trust,
+);
+Self {
+    handlers: discovered.handlers,
+    warnings: discovered.warnings,
+    shell,
+    output_spiller: HookOutputSpiller::new(),
+}
+```
+
+After that, runtime selection is separate:
+
+- `select_handlers()` filters the in-memory registry by event name + matcher
+- `execute_handlers()` runs selected handlers
+- results are returned in configured order even if execution completes out of order
 
 ## What Codex validates
 
@@ -47,113 +175,26 @@
 
 A concrete proof point is `core/tests/suite/hooks.rs::pre_tool_use_merges_hooks_json_and_config_toml()`, plus `hooks/src/engine/discovery.rs`, which shows the append order and the per-folder `visited_json_hook_folders` dedup.
 
-## How Codex turns discovered hooks into runtime handlers
+## Implication for Pi Hooks
 
-After discovery, Codex performs a normalization pass before runtime dispatch:
+For Pi Hooks, the Codex pattern to copy is:
 
-- `load_hooks_json()` reads and parses `hooks.json` into `HooksFile`, then extracts `HookEventsToml`
-- `append_hook_events()` iterates event buckets
-- `append_matcher_groups()` walks matcher groups in file order and handlers in group order
-- each command hook is normalized into in-memory metadata, not executed directly from raw parsed JSON
+1. discover config files in deterministic order
+2. parse each `hooks.json`
+3. normalize all handlers once into an in-memory registry
+4. preserve configured order
+5. keep runtime event dispatch separate from config loading
 
-The key normalized runtime record is `ConfiguredHandler`, which stores:
+Pi should simplify by omitting TOML hook loading entirely.
 
-- event name
-- matcher string
-- command string
-- normalized timeout
-- status message
-- source path / source kind
-- display order
-- env substitutions
-
-Loader-time normalization / filtering includes:
-
-- choose `commandWindows` on Windows
-- reject unsupported async hooks
-- reject empty commands
-- normalize timeouts
-- validate matcher strings
-- substitute source-provided env vars into commands
-
-Codex also creates a parallel inspection record, `HookListEntry`, so the system can list discovered hooks separately from the subset that will actually execute.
-
-Then `ClaudeHooksEngine::new()` stores the discovered `ConfiguredHandler` list in memory once. Runtime execution is a separate phase:
-
-- `select_handlers()` filters by event name + matcher
-- `execute_handlers()` runs the selected handlers
-- results are returned in configured order even if command completion order differs
-
-## How Codex activates hooks
-
-- Discovery/listing and runtime activation are separate steps.
-- Listed hooks carry metadata: source, enabled, managed, hash, trust status.
-- Managed hooks are always trusted.
-- User/project/plugin hooks run only when:
-    - the hooks feature is enabled,
-    - the hook is enabled,
-    - and either trusted hash matches or bypass-trust is active.
-- Startup warnings are surfaced for malformed files and dangerous bypass mode.
-- Session startup builds a hook registry once from config + plugins.
-- Core runtime calls preview/run methods at concrete lifecycle points (`SessionStart`, `PreToolUse`, `PostToolUse`, etc.).
-
-## Codex command I/O contract
-
-Codex command hooks are not just fire-and-forget shell commands.
-
-They receive structured JSON on stdin and can return structured JSON on stdout.
-This enables hooks to:
-
-- block execution
-- rewrite tool input (`PreToolUse.updatedInput`)
-- add context for the model
-- emit feedback / stop reasons
-
-For Pi, this is the key design decision: if `hooks.json` is meant to be “similar to Codex”, command hooks should use a structured stdin/stdout protocol rather than relying only on exit codes.
-
-## Recommended Pi v1 adaptation
-
-### Validation
+### Pi adaptation
 
 - Keep `hooks.json` strict and JSON-only.
-- Reject unknown event names and unknown handler fields.
-- Support only `type: "command"` in v1; reject other handler types instead of silently skipping them.
-- Move cross-field checks into the loader:
-    - command must be non-empty
-    - timeout normalized to default `600`, min `1`
-    - matcher compiled only for events with documented matcher input
-- Define matcher semantics exactly like Codex: `None|""|"*"`, exact literals, `|` alternatives, regex fallback.
-
-### Loading
-
-- Load global hooks from `~/.pi/hooks.json`.
-- Load project hooks from ancestor `.pi/hooks.json` files in root-to-leaf order.
-- Append all discovered handlers in deterministic order; do not deep-merge by key.
+- Use `pi-hooks.schema.json` as the canonical file-shape validator.
+- Load global `~/.pi/hooks.json` first, then project-local `.pi/hooks.json` files from root to leaf.
+- Append all discovered handlers in deterministic order.
 - Deduplicate only by exact file path so the same file is not loaded twice.
-- Keep trust/activation separate from loading; Pi does not natively provide a trust layer.
-
-### Activation
-
-- Implement `pi-hooks` as a normal Pi extension that reads configs and registers `pi.on(...)` handlers.
-- Pi has no native trust gate, so `pi-hooks` must not assume a built-in `project_trust` policy.
-- Global vs project-local scope comes from discovery order, not from Pi core trust state.
-- If later we want selective activation, it should be an explicit `pi-hooks` policy, not a dependency on Pi core trust.
-- Command hooks should receive event JSON on stdin and return JSON on stdout.
-- The first release should support two hook behaviors:
-    - passive side effects on any event
-    - blocking / mutation only on events whose Pi extension API already supports it (`tool_call`, `tool_result`, `before_agent_start`, `context`, etc.)
-- Event-specific adapters should be explicit rather than generic magic.
-
-## Recommended initial scope
-
-Start with:
-
-- `project_trust`
-- `session_start`
-- `before_agent_start`
-- `tool_call`
-- `tool_result`
-- `tool_execution_end`
-- `session_shutdown`
-
-That subset covers the most useful Codex-like workflows without needing every Pi event at once.
+- Normalize each discovered handler once into an in-memory registry.
+- Keep loader concerns separate from any later runtime dispatch concerns.
+- Treat a malformed `hooks.json` as a startup warning that skips the whole file.
+- Treat partially invalid handlers inside a valid file as per-entry warnings that skip only the bad entries.
