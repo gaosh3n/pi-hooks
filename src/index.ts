@@ -2,7 +2,7 @@ import { Ajv2020 } from "ajv/dist/2020.js"
 import { readFileSync } from "node:fs"
 import { access, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { ErrorObject, ValidateFunction } from "ajv"
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent"
@@ -60,18 +60,25 @@ export async function loadUserHooksRegistry(options: { homeDir?: string } = {}):
         return EMPTY_REGISTRY
     }
 
-    const parsed = parseJsonObject(await readFile(sourcePath, "utf8"), sourcePath)
-    validateParsedHooksFile(parsed, sourcePath)
-    const events = normalizeHooksFile(parsed)
+    const loadedFile = await loadHooksFile(sourcePath)
+    return { files: [loadedFile] }
+}
 
-    return {
-        files: [
-            {
-                sourcePath,
-                events,
-            },
-        ],
+export async function loadHooksRegistry(options: { homeDir?: string; cwd?: string } = {}): Promise<HookRegistry> {
+    const homeDir = options.homeDir ?? homedir()
+    const cwd = resolve(options.cwd ?? process.cwd())
+    const sourcePaths = await discoverHookFilePaths({ homeDir, cwd })
+    const files: LoadedHooksFile[] = []
+
+    for (const sourcePath of sourcePaths) {
+        if (!(await fileExists(sourcePath))) {
+            continue
+        }
+
+        files.push(await loadHooksFile(sourcePath))
     }
+
+    return { files }
 }
 
 export function getHookRegistry(): HookRegistry {
@@ -80,8 +87,54 @@ export function getHookRegistry(): HookRegistry {
 
 export default function setup(pi: ExtensionAPI) {
     pi.on("session_start", async (_event: SessionStartEvent, _ctx: ExtensionContext) => {
-        activeRegistry = await loadUserHooksRegistry()
+        activeRegistry = await loadHooksRegistry()
     })
+}
+
+async function discoverHookFilePaths(options: { homeDir: string; cwd: string }) {
+    const seen = new Set<string>()
+    const discoveredPaths: string[] = []
+
+    const addPath = (path: string) => {
+        if (seen.has(path)) {
+            return
+        }
+
+        seen.add(path)
+        discoveredPaths.push(path)
+    }
+
+    addPath(join(options.homeDir, ".pi", "hooks.json"))
+
+    for (const directory of listAncestorDirectories(options.cwd)) {
+        addPath(join(directory, ".pi", "hooks.json"))
+    }
+
+    return discoveredPaths
+}
+
+function listAncestorDirectories(cwd: string) {
+    const absoluteCwd = isAbsolute(cwd) ? cwd : resolve(cwd)
+    const segments = absoluteCwd.split("/").filter(Boolean)
+    const directories = ["/"]
+    let currentDirectory = ""
+
+    for (const segment of segments) {
+        currentDirectory = `${currentDirectory}/${segment}`
+        directories.push(currentDirectory)
+    }
+
+    return directories
+}
+
+async function loadHooksFile(sourcePath: string): Promise<LoadedHooksFile> {
+    const parsed = parseJsonObject(await readFile(sourcePath, "utf8"), sourcePath)
+    validateParsedHooksFile(parsed, sourcePath)
+
+    return {
+        sourcePath,
+        events: normalizeHooksFile(parsed),
+    }
 }
 
 async function fileExists(path: string) {

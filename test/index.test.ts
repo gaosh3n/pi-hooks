@@ -1,9 +1,9 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent"
 import { afterEach, describe, expect, it } from "vitest"
-import setup, { getHookRegistry, loadUserHooksRegistry, type HookRegistry } from "../src/index.ts"
+import setup, { getHookRegistry, loadHooksRegistry, loadUserHooksRegistry, type HookRegistry } from "../src/index.ts"
 
 const tempDirs: string[] = []
 
@@ -53,11 +53,12 @@ describe("pi hooks loader", () => {
         )
 
         const registry = await loadUserHooksRegistry({ homeDir })
+        const expectedSourcePath = join(homeDir, ".pi", "hooks.json")
 
         expect(registry).toEqual<HookRegistry>({
             files: [
                 {
-                    sourcePath: join(homeDir, ".pi", "hooks.json"),
+                    sourcePath: expectedSourcePath,
                     events: [
                         {
                             eventName: "session_start",
@@ -196,8 +197,11 @@ describe("pi hooks loader", () => {
             }),
         )
 
+        const canonicalHomeDir = await realpath(homeDir)
         const previousHome = process.env.HOME
-        process.env.HOME = homeDir
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
 
         try {
             const { pi, handlers } = createExtensionApiDouble()
@@ -210,11 +214,12 @@ describe("pi hooks loader", () => {
             expect(sessionStart).toBeTypeOf("function")
 
             await sessionStart?.({ type: "session_start", reason: "startup" }, {} as ExtensionContext)
+            const expectedSourcePath = join(canonicalHomeDir, ".pi", "hooks.json")
 
             expect(getHookRegistry()).toEqual<HookRegistry>({
                 files: [
                     {
-                        sourcePath: join(homeDir, ".pi", "hooks.json"),
+                        sourcePath: expectedSourcePath,
                         events: [
                             {
                                 eventName: "session_start",
@@ -237,7 +242,179 @@ describe("pi hooks loader", () => {
             })
         } finally {
             process.env.HOME = previousHome
+            process.chdir(previousCwd)
         }
+    })
+
+    it("loads only the user-level hooks file from loadUserHooksRegistry", async () => {
+        const tempRoot = await mkdtemp(join(tmpdir(), "pi-hooks-root-"))
+        tempDirs.push(tempRoot)
+
+        const homeDir = join(tempRoot, "home", "user")
+        await mkdir(join(homeDir, ".pi"), { recursive: true })
+        await mkdir(join(tempRoot, "home", ".pi"), { recursive: true })
+
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo user" }] }],
+                },
+            }),
+        )
+        await writeFile(
+            join(tempRoot, "home", ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo ancestor" }] }],
+                },
+            }),
+        )
+
+        const registry = await loadUserHooksRegistry({ homeDir })
+
+        expect(registry.files.map((file) => file.sourcePath)).toEqual([join(homeDir, ".pi", "hooks.json")])
+    })
+
+    it("loads the global hooks file before project-local hooks files from root to leaf", async () => {
+        const homeDir = await makeTempHome()
+        const workspaceRoot = join(homeDir, "workspace")
+        const projectDir = join(workspaceRoot, "apps", "demo")
+
+        await mkdir(join(workspaceRoot, ".pi"), { recursive: true })
+        await mkdir(join(workspaceRoot, "apps", ".pi"), { recursive: true })
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo global" }] }],
+                },
+            }),
+        )
+        await writeFile(
+            join(workspaceRoot, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo root" }] }],
+                },
+            }),
+        )
+        await writeFile(
+            join(workspaceRoot, "apps", ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo apps" }] }],
+                },
+            }),
+        )
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo project" }] }],
+                },
+            }),
+        )
+
+        const registry = await loadHooksRegistry({ homeDir, cwd: projectDir })
+
+        expect(registry.files.map((file) => file.sourcePath)).toEqual([
+            join(homeDir, ".pi", "hooks.json"),
+            join(workspaceRoot, ".pi", "hooks.json"),
+            join(workspaceRoot, "apps", ".pi", "hooks.json"),
+            join(projectDir, ".pi", "hooks.json"),
+        ])
+    })
+
+    it("loads merged global and project-local hooks on session start", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo global" }] }],
+                },
+            }),
+        )
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo project" }] }],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = handlers.session_start as
+                | ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>)
+                | undefined
+
+            await sessionStart?.({ type: "session_start", reason: "startup" }, {} as ExtensionContext)
+
+            expect(getHookRegistry().files.map((file) => file.sourcePath)).toEqual([
+                join(canonicalHomeDir, ".pi", "hooks.json"),
+                join(canonicalProjectDir, ".pi", "hooks.json"),
+            ])
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not collapse distinct discovered path strings that resolve to the same file", async () => {
+        const realHomeDir = await makeTempHome()
+        const aliasRoot = await mkdtemp(join(tmpdir(), "pi-hooks-alias-"))
+        tempDirs.push(aliasRoot)
+        const aliasHomeDir = join(aliasRoot, "linked-home")
+
+        await symlink(realHomeDir, aliasHomeDir)
+        await writeFile(
+            join(realHomeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo once" }] }],
+                },
+            }),
+        )
+
+        const registry = await loadHooksRegistry({ homeDir: aliasHomeDir, cwd: realHomeDir })
+
+        expect(registry.files.map((file) => file.sourcePath)).toEqual([
+            join(aliasHomeDir, ".pi", "hooks.json"),
+            join(realHomeDir, ".pi", "hooks.json"),
+        ])
+    })
+
+    it("dedupes an exact hooks.json path discovered as both global and project-local", async () => {
+        const homeDir = await makeTempHome()
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo once" }] }],
+                },
+            }),
+        )
+
+        const registry = await loadHooksRegistry({ homeDir, cwd: homeDir })
+
+        expect(registry.files.map((file) => file.sourcePath)).toEqual([join(homeDir, ".pi", "hooks.json")])
     })
 
     it("exports a setup function", () => {
