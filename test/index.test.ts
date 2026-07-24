@@ -212,10 +212,26 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("rejects a hooks.json with extra root properties", async () => {
+    it("warns and skips a malformed user-level hooks.json", async () => {
         const homeDir = await makeTempHome()
+        const sourcePath = join(homeDir, ".pi", "hooks.json")
+        await writeFile(sourcePath, "{not valid json")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            await expect(loadUserHooksRegistry({ homeDir })).resolves.toEqual({ files: [] } satisfies HookRegistry)
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining(sourcePath))
+            expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Unexpected token|Expected property name/))
+        } finally {
+            warn.mockRestore()
+        }
+    })
+
+    it("warns and skips a schema-invalid user-level hooks.json", async () => {
+        const homeDir = await makeTempHome()
+        const sourcePath = join(homeDir, ".pi", "hooks.json")
         await writeFile(
-            join(homeDir, ".pi", "hooks.json"),
+            sourcePath,
             JSON.stringify({
                 hooks: {
                     session_start: [
@@ -227,57 +243,125 @@ describe("pi hooks loader", () => {
                 unexpected: true,
             }),
         )
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
 
-        await expect(loadUserHooksRegistry({ homeDir })).rejects.toThrow(/unexpected/)
+        try {
+            await expect(loadUserHooksRegistry({ homeDir })).resolves.toEqual({ files: [] } satisfies HookRegistry)
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining(sourcePath))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("unexpected"))
+        } finally {
+            warn.mockRestore()
+        }
     })
 
-    it("rejects a hooks.json with empty hooks object", async () => {
+    it("warns with the schema validation reason when the user-level hooks file is invalid", async () => {
         const homeDir = await makeTempHome()
-        await writeFile(join(homeDir, ".pi", "hooks.json"), JSON.stringify({ hooks: {} }))
+        const sourcePath = join(homeDir, ".pi", "hooks.json")
+        await writeFile(sourcePath, JSON.stringify({ hooks: {} }))
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
 
-        await expect(loadUserHooksRegistry({ homeDir })).rejects.toThrow(/hooks/)
+        try {
+            await expect(loadUserHooksRegistry({ homeDir })).resolves.toEqual({ files: [] } satisfies HookRegistry)
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining(sourcePath))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("must NOT have fewer than 1 properties"))
+        } finally {
+            warn.mockRestore()
+        }
     })
 
-    it("rejects a matcher group with an empty hooks array", async () => {
+    it("loads other discovered hook files when one project hooks file is schema-invalid", async () => {
         const homeDir = await makeTempHome()
+        const workspaceRoot = join(homeDir, "workspace")
+        const projectDir = join(workspaceRoot, "apps", "demo")
+
+        await mkdir(join(workspaceRoot, ".pi"), { recursive: true })
+        await mkdir(join(workspaceRoot, "apps", ".pi"), { recursive: true })
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
         await writeFile(
             join(homeDir, ".pi", "hooks.json"),
             JSON.stringify({
                 hooks: {
-                    session_start: [
-                        {
-                            hooks: [],
-                        },
-                    ],
+                    session_start: [{ hooks: [{ type: "command", command: "echo global" }] }],
                 },
             }),
         )
+        await writeFile(
+            join(workspaceRoot, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo root" }] }],
+                },
+            }),
+        )
+        const invalidProjectHooksPath = join(workspaceRoot, "apps", ".pi", "hooks.json")
+        await writeFile(invalidProjectHooksPath, JSON.stringify({ hooks: {} }))
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo project" }] }],
+                },
+            }),
+        )
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
 
-        await expect(loadUserHooksRegistry({ homeDir })).rejects.toThrow(/hooks/)
+        try {
+            const registry = await loadHooksRegistry({ homeDir, cwd: projectDir })
+
+            expect(registry.files.map((file) => file.sourcePath)).toEqual([
+                join(homeDir, ".pi", "hooks.json"),
+                join(workspaceRoot, ".pi", "hooks.json"),
+                join(projectDir, ".pi", "hooks.json"),
+            ])
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining(invalidProjectHooksPath))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("must NOT have fewer than 1 properties"))
+        } finally {
+            warn.mockRestore()
+        }
     })
 
-    it("rejects a handler with extra properties", async () => {
+    it("loads other discovered hook files when one project hooks file is malformed", async () => {
         const homeDir = await makeTempHome()
+        const workspaceRoot = join(homeDir, "workspace")
+        const projectDir = join(workspaceRoot, "apps", "demo")
+
+        await mkdir(join(workspaceRoot, ".pi"), { recursive: true })
+        await mkdir(join(workspaceRoot, "apps", ".pi"), { recursive: true })
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
         await writeFile(
             join(homeDir, ".pi", "hooks.json"),
             JSON.stringify({
                 hooks: {
-                    session_start: [
-                        {
-                            hooks: [
-                                {
-                                    type: "command",
-                                    command: "echo hello",
-                                    extra: true,
-                                },
-                            ],
-                        },
-                    ],
+                    session_start: [{ hooks: [{ type: "command", command: "echo global" }] }],
                 },
             }),
         )
+        const invalidProjectHooksPath = join(workspaceRoot, "apps", ".pi", "hooks.json")
+        await writeFile(invalidProjectHooksPath, "{bad json")
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: "echo project" }] }],
+                },
+            }),
+        )
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
 
-        await expect(loadUserHooksRegistry({ homeDir })).rejects.toThrow(/extra/)
+        try {
+            const registry = await loadHooksRegistry({ homeDir, cwd: projectDir })
+
+            expect(registry.files.map((file) => file.sourcePath)).toEqual([
+                join(homeDir, ".pi", "hooks.json"),
+                join(projectDir, ".pi", "hooks.json"),
+            ])
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining(invalidProjectHooksPath))
+            expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Unexpected token|Expected property name/))
+        } finally {
+            warn.mockRestore()
+        }
     })
 
     it("loads the user-level hooks registry on session start", async () => {

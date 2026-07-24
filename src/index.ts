@@ -63,8 +63,8 @@ export async function loadUserHooksRegistry(options: { homeDir?: string } = {}):
         return EMPTY_REGISTRY
     }
 
-    const loadedFile = await loadHooksFile(sourcePath)
-    return { files: [loadedFile] }
+    const loadedFile = await tryLoadDiscoveredHooksFile(sourcePath)
+    return loadedFile === undefined ? EMPTY_REGISTRY : { files: [loadedFile] }
 }
 
 export async function loadHooksRegistry(options: { homeDir?: string; cwd?: string } = {}): Promise<HookRegistry> {
@@ -78,7 +78,10 @@ export async function loadHooksRegistry(options: { homeDir?: string; cwd?: strin
             continue
         }
 
-        files.push(await loadHooksFile(sourcePath))
+        const loadedFile = await tryLoadDiscoveredHooksFile(sourcePath)
+        if (loadedFile !== undefined) {
+            files.push(loadedFile)
+        }
     }
 
     return { files }
@@ -140,6 +143,19 @@ async function loadHooksFile(sourcePath: string): Promise<LoadedHooksFile> {
     }
 }
 
+async function tryLoadDiscoveredHooksFile(sourcePath: string): Promise<LoadedHooksFile | undefined> {
+    try {
+        return await loadHooksFile(sourcePath)
+    } catch (error) {
+        if (!isSkippableDiscoveredFileError(error, sourcePath)) {
+            throw error
+        }
+
+        console.warn((error as Error).message)
+        return undefined
+    }
+}
+
 async function fileExists(path: string) {
     try {
         await access(path)
@@ -194,6 +210,10 @@ function formatSchemaError(error: ErrorObject) {
     }
 
     return `${error.instancePath || "/"} ${error.message}`
+}
+
+function isSkippableDiscoveredFileError(error: unknown, sourcePath: string) {
+    return error instanceof Error && error.message.startsWith(`Invalid hooks.json at ${sourcePath}:`)
 }
 
 function normalizeHooksFile(parsed: JsonObject, sourcePath: string) {
