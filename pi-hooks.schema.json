@@ -175,7 +175,7 @@
             "properties": {
                 "matcher": {
                     "type": "string",
-                    "description": "Regex string that filters when a matcher group fires. Use *, an empty string, or omit matcher to match broadly."
+                    "description": "Matcher string that filters when a matcher group fires. Omit matcher, use an empty string, or use * to match all. Plain literals such as read match exactly. Pipe-separated literals such as edit|write mean exact alternatives. Patterns with regex metacharacters such as ^read$ are treated as regex."
                 },
                 "hooks": {
                     "type": "array",

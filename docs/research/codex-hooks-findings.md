@@ -159,6 +159,126 @@ After that, runtime selection is separate:
 - Invalid regexes are warned and skipped only for matcher-capable events.
 - Timeouts are normalized at load time, not just schema time.
 
+## Codex matcher-pattern semantics
+
+Codex's matcher logic lives in `<root-directory>/codex-rs/hooks/src/events/common.rs`.
+
+Two helpers matter:
+
+- `validate_matcher_pattern(matcher)`
+- `matches_matcher(matcher, input)`
+
+The behavior is:
+
+- omitted matcher (`None`) => match all
+- `""` => match all
+- `"*"` => match all
+- exact matchers are matched by string equality, not regex substring matching
+- `|` inside an exact matcher means exact alternatives, e.g. `Edit|Write`
+- only patterns that are not match-all and not exact are compiled as regex
+
+Key source excerpt:
+
+```rust
+pub(crate) fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
+    if is_match_all_matcher(matcher) || is_exact_matcher(matcher) {
+        return Ok(());
+    }
+    regex::Regex::new(matcher).map(|_| ())
+}
+
+pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> bool {
+    match matcher {
+        None => true,
+        Some(matcher) if is_match_all_matcher(matcher) => true,
+        Some(matcher) if is_exact_matcher(matcher) => input
+            .map(|input| matcher.split('|').any(|candidate| candidate == input))
+            .unwrap_or(false),
+        Some(matcher) => input
+            .and_then(|input| regex::Regex::new(matcher).ok().map(|regex| regex.is_match(input)))
+            .unwrap_or(false),
+    }
+}
+```
+
+Important implication: Codex does **not** treat every matcher as regex. It has a three-way classification:
+
+1. match-all
+2. exact literal / exact alternatives
+3. regex
+
+This is why `Bash` matches only `Bash`, while `Edit|Write` matches either exact tool name, and `^Bash(Output)?$` is treated as regex.
+
+## Codex matcher coverage by event
+
+Codex also makes matcher coverage event-specific via `matcher_pattern_for_event(event_name, matcher)`.
+
+- matcher-capable events include `PreToolUse`, `PermissionRequest`, `PostToolUse`, `SessionStart`, `SessionEnd`, `SubagentStart`, `SubagentStop`, `PreCompact`, and `PostCompact`
+- `UserPromptSubmit` and `Stop` ignore matchers entirely and force `None`
+
+So Codex has two separate questions:
+
+1. does this event even use a matcher?
+2. if it does, is the matcher match-all, exact, or regex?
+
+## Codex tool coverage for literal matchers
+
+For tool-related events, Codex literal matcher examples in docs often use built-in tool names like `Bash`, `Edit`, and `Write`, but the source/tests show that the exact-matcher path is not limited to only those names.
+
+For example, `common.rs` tests exact matching for an MCP tool name:
+
+```rust
+assert!(matches_matcher(
+    Some("mcp__memory__create_entities"),
+    Some("mcp__memory__create_entities")
+));
+assert!(!matches_matcher(
+    Some("mcp__memory"),
+    Some("mcp__memory__create_entities")
+));
+```
+
+That means the Codex rule is really syntax-based exact matching, not "only a fixed enum of built-in tools." Built-in tool names are just the easiest examples to document.
+
+## Pi-native tool coverage to mirror, not copy
+
+Pi should not copy Codex tool-name examples blindly. Pi has its own tool vocabulary.
+
+From Pi's installed docs and type declarations:
+
+- built-in `tool_call` names are:
+    - `bash`
+    - `read`
+    - `edit`
+    - `write`
+    - `grep`
+    - `find`
+    - `ls`
+- Pi also supports custom tools registered through `pi.registerTool({ name: string, ... })`
+- `CustomToolCallEvent` therefore uses `toolName: string`, not a closed literal union
+
+Key Pi type excerpt:
+
+```ts
+export interface BashToolCallEvent extends ToolCallEventBase {
+    toolName: "bash";
+    input: BashToolInput;
+}
+// ... read/edit/write/grep/find/ls omitted ...
+export interface CustomToolCallEvent extends ToolCallEventBase {
+    toolName: string;
+    input: Record<string, unknown>;
+}
+```
+
+And Pi docs explicitly describe `tool_call` examples with `event.toolName - "bash", "read", "write", "edit", etc.` plus custom tools typed via `isToolCallEventType<"my_tool", ...>("my_tool", event)`.
+
+Implication for Pi Hooks:
+
+- examples for `tool_call` matcher semantics should use Pi-native tool names like `read`, `edit|write`, or custom names like `my_tool`
+- the loader should not assume a closed Codex-style whitelist of literal values
+- plain literals must be classified by syntax, then preserved for later exact matching against Pi's actual tool names
+
 ## How Codex loads hooks
 
 - Hook discovery is gated by a feature flag.

@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import setup, { getHookRegistry, loadHooksRegistry, loadUserHooksRegistry, type HookRegistry } from "../src/index.ts"
 
 const tempDirs: string[] = []
@@ -65,6 +65,7 @@ describe("pi hooks loader", () => {
                             matcherGroups: [
                                 {
                                     matcher: undefined,
+                                    normalizedMatcher: { kind: "all" },
                                     hooks: [
                                         {
                                             enabled: true,
@@ -80,6 +81,30 @@ describe("pi hooks loader", () => {
                 },
             ],
         })
+    })
+
+    it("normalizes omitted, empty, and star matchers as match-all", async () => {
+        const homeDir = await makeTempHome()
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        { hooks: [{ type: "command", command: "echo omitted" }] },
+                        { matcher: "", hooks: [{ type: "command", command: "echo empty" }] },
+                        { matcher: "*", hooks: [{ type: "command", command: "echo star" }] },
+                    ],
+                },
+            }),
+        )
+
+        const registry = await loadUserHooksRegistry({ homeDir })
+
+        expect(registry.files[0]?.events[0]?.matcherGroups.map((group) => group.normalizedMatcher)).toEqual([
+            { kind: "all" },
+            { kind: "all" },
+            { kind: "all" },
+        ])
     })
 
     it("preserves schema-defined event names and configured order", async () => {
@@ -112,6 +137,79 @@ describe("pi hooks loader", () => {
             "echo first",
             "echo second",
         ])
+    })
+
+    it("normalizes literal, exact-alternative, and regex matchers during loading", async () => {
+        const homeDir = await makeTempHome()
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        { matcher: "read", hooks: [{ type: "command", command: "echo literal" }] },
+                        { matcher: "edit|write", hooks: [{ type: "command", command: "echo alternatives" }] },
+                        { matcher: "^read$", hooks: [{ type: "command", command: "echo regex" }] },
+                    ],
+                },
+            }),
+        )
+
+        const registry = await loadUserHooksRegistry({ homeDir })
+
+        expect(registry.files[0]?.events[0]?.matcherGroups.map((group) => group.normalizedMatcher)).toEqual([
+            { kind: "exact", values: ["read"] },
+            { kind: "exact", values: ["edit", "write"] },
+            { kind: "regex", pattern: "^read$" },
+        ])
+    })
+
+    it("treats non-metacharacter literals like read-file as exact matchers", async () => {
+        const homeDir = await makeTempHome()
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [{ matcher: "read-file", hooks: [{ type: "command", command: "echo literal" }] }],
+                },
+            }),
+        )
+
+        const registry = await loadUserHooksRegistry({ homeDir })
+
+        expect(registry.files[0]?.events[0]?.matcherGroups[0]?.normalizedMatcher).toEqual({
+            kind: "exact",
+            values: ["read-file"],
+        })
+    })
+
+    it("warns and skips matcher groups with invalid regex patterns", async () => {
+        const homeDir = await makeTempHome()
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        { matcher: "[", hooks: [{ type: "command", command: "echo bad" }] },
+                        { matcher: "read", hooks: [{ type: "command", command: "echo good" }] },
+                    ],
+                },
+            }),
+        )
+
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            const registry = await loadUserHooksRegistry({ homeDir })
+
+            expect(registry.files[0]?.events[0]?.matcherGroups).toHaveLength(1)
+            expect(registry.files[0]?.events[0]?.matcherGroups[0]?.normalizedMatcher).toEqual({
+                kind: "exact",
+                values: ["read"],
+            })
+            expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Invalid matcher.*\[/))
+        } finally {
+            warn.mockRestore()
+        }
     })
 
     it("rejects a hooks.json with extra root properties", async () => {
@@ -226,6 +324,7 @@ describe("pi hooks loader", () => {
                                 matcherGroups: [
                                     {
                                         matcher: undefined,
+                                        normalizedMatcher: { kind: "all" },
                                         hooks: [
                                             {
                                                 enabled: true,

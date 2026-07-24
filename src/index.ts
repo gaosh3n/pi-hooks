@@ -26,8 +26,11 @@ export interface LoadedHook {
     statusMessage?: string
 }
 
+export type LoadedMatcher = { kind: "all" } | { kind: "exact"; values: string[] } | { kind: "regex"; pattern: string }
+
 export interface LoadedMatcherGroup {
     matcher: string | undefined
+    normalizedMatcher: LoadedMatcher
     hooks: LoadedHook[]
 }
 
@@ -133,7 +136,7 @@ async function loadHooksFile(sourcePath: string): Promise<LoadedHooksFile> {
 
     return {
         sourcePath,
-        events: normalizeHooksFile(parsed),
+        events: normalizeHooksFile(parsed, sourcePath),
     }
 }
 
@@ -193,7 +196,7 @@ function formatSchemaError(error: ErrorObject) {
     return `${error.instancePath || "/"} ${error.message}`
 }
 
-function normalizeHooksFile(parsed: JsonObject) {
+function normalizeHooksFile(parsed: JsonObject, sourcePath: string) {
     const hooks = parsed.hooks
     if (!isJsonObject(hooks)) {
         throw new Error("Invalid hooks.json: hooks must be an object")
@@ -201,7 +204,7 @@ function normalizeHooksFile(parsed: JsonObject) {
 
     return Object.entries(hooks).map(([eventName, matcherGroups]) => ({
         eventName: normalizeEventName(eventName),
-        matcherGroups: normalizeMatcherGroups(matcherGroups),
+        matcherGroups: normalizeMatcherGroups(matcherGroups, { eventName, sourcePath }),
     }))
 }
 
@@ -213,12 +216,17 @@ function normalizeEventName(eventName: string) {
     return eventName
 }
 
-function normalizeMatcherGroups(value: JsonValue): LoadedMatcherGroup[] {
+function normalizeMatcherGroups(
+    value: JsonValue,
+    context: { eventName: string; sourcePath: string },
+): LoadedMatcherGroup[] {
     if (!Array.isArray(value)) {
         throw new Error("Invalid hooks.json: event registrations must be arrays")
     }
 
-    return value.map((matcherGroup) => {
+    const matcherGroups: LoadedMatcherGroup[] = []
+
+    for (const matcherGroup of value) {
         if (!isJsonObject(matcherGroup)) {
             throw new Error("Invalid hooks.json: matcher groups must be objects")
         }
@@ -228,11 +236,46 @@ function normalizeMatcherGroups(value: JsonValue): LoadedMatcherGroup[] {
             throw new Error("Invalid hooks.json: matcher must be a string when present")
         }
 
-        return {
-            matcher,
-            hooks: (matcherGroup.hooks as JsonValue[]).map(normalizeHook),
+        try {
+            matcherGroups.push({
+                matcher,
+                normalizedMatcher: normalizeMatcher(matcher),
+                hooks: (matcherGroup.hooks as JsonValue[]).map(normalizeHook),
+            })
+        } catch (error) {
+            console.warn(
+                `Invalid matcher in hooks.json at ${context.sourcePath} for ${context.eventName}: ${matcher ?? "<omitted>"} (${(error as Error).message})`,
+            )
         }
-    })
+    }
+
+    return matcherGroups
+}
+
+function normalizeMatcher(matcher: string | undefined): LoadedMatcher {
+    if (matcher === undefined || matcher === "" || matcher === "*") {
+        return { kind: "all" }
+    }
+
+    if (isExactMatcher(matcher)) {
+        return { kind: "exact", values: matcher.split("|") }
+    }
+
+    try {
+        new RegExp(matcher)
+    } catch (error) {
+        throw new Error((error as Error).message)
+    }
+
+    return { kind: "regex", pattern: matcher }
+}
+
+function isExactMatcher(matcher: string) {
+    return matcher.split("|").every((candidate) => !hasRegexMetacharacters(candidate))
+}
+
+function hasRegexMetacharacters(value: string) {
+    return /[\\^$.*+?()[\]{}]/.test(value)
 }
 
 function normalizeHook(value: JsonValue): LoadedHook {
