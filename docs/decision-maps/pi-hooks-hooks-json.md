@@ -73,6 +73,15 @@ The conclusion is:
 - but use `hooks.json` as the sole Pi Hooks config source
 - the implementation should stay focused on deterministic discovery order
 
+Concrete Pi policy:
+
+- keep `hooks.json` strict and JSON-only
+- load global `~/.pi/hooks.json` first
+- then load ancestor project `.pi/hooks.json` files from root → leaf
+- append all discovered handlers in deterministic order
+- deduplicate only by exact file path so the same file is not loaded twice
+- omit TOML hook loading entirely
+
 ## #3: How should Pi load hooks after they are discovered?
 
 Blocked by: #1, #2
@@ -134,6 +143,14 @@ So for Pi, “load hooks after discovery” means:
 - store them in one ordered in-memory registry
 - let the Pi extension consume that registry later
 
+Additional Pi-specific guidance derived from the research:
+
+- keep loader concerns separate from later runtime dispatch concerns
+- preserve all configured order from file discovery down to handler order
+- examples for `tool_call` matcher semantics should use Pi-native tool names like `read` or `edit|write`, plus custom tool names such as `my_tool`
+- plain literal matchers must be classified by syntax, not by a closed built-in tool whitelist
+- literal tool matcher support must remain open to custom Pi tool names, not just built-ins
+
 With those decisions made, the path to implementation is now clear enough that no further decision-map tickets are required.
 
 ## #4: What should happen when a discovered `hooks.json` is malformed or partially invalid?
@@ -153,5 +170,11 @@ Loader behavior should be split into two cases:
 
 - **Malformed `hooks.json` file**: warn clearly and skip the whole file.
 - **Partially invalid entries inside a valid file**: skip only the bad handler/group entry, keep the rest of the file, and warn clearly.
+
+Concretely for Pi:
+
+- malformed includes JSON parse failure and whole-file schema validation failure
+- whole-file invalidity should not crash Pi or block loading other valid discovered files
+- entry-level invalidity should remain a normalization concern, not a discovered-file loading failure
 
 That matches Codex’s behavior: JSON parse failures are treated as startup warnings and prevent the file from loading, while invalid matchers, unsupported async hooks, empty commands, and unsupported handler types are skipped individually during normalization.

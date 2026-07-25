@@ -1,4 +1,4 @@
-# Codex hooks findings for `pi-hooks`
+# Codex hooks findings
 
 This note consolidates the former `codex-hooks-merge.showboat.md` research into one place.
 
@@ -15,7 +15,6 @@ This note consolidates the former `codex-hooks-merge.showboat.md` research into 
 - `<root-directory>/codex-rs/core/src/hook_runtime.rs`
 - `<root-directory>/codex-rs/core/src/session/mod.rs`
 - `<root-directory>/codex-rs/core/src/config/config_loader_tests.rs`
-- Pi docs: `docs/extensions.md`
 
 ## Discovery / merge order
 
@@ -240,45 +239,6 @@ assert!(!matches_matcher(
 
 That means the Codex rule is really syntax-based exact matching, not "only a fixed enum of built-in tools." Built-in tool names are just the easiest examples to document.
 
-## Pi-native tool coverage to mirror, not copy
-
-Pi should not copy Codex tool-name examples blindly. Pi has its own tool vocabulary.
-
-From Pi's installed docs and type declarations:
-
-- built-in `tool_call` names are:
-    - `bash`
-    - `read`
-    - `edit`
-    - `write`
-    - `grep`
-    - `find`
-    - `ls`
-- Pi also supports custom tools registered through `pi.registerTool({ name: string, ... })`
-- `CustomToolCallEvent` therefore uses `toolName: string`, not a closed literal union
-
-Key Pi type excerpt:
-
-```ts
-export interface BashToolCallEvent extends ToolCallEventBase {
-    toolName: "bash";
-    input: BashToolInput;
-}
-// ... read/edit/write/grep/find/ls omitted ...
-export interface CustomToolCallEvent extends ToolCallEventBase {
-    toolName: string;
-    input: Record<string, unknown>;
-}
-```
-
-And Pi docs explicitly describe `tool_call` examples with `event.toolName - "bash", "read", "write", "edit", etc.` plus custom tools typed via `isToolCallEventType<"my_tool", ...>("my_tool", event)`.
-
-Implication for Pi Hooks:
-
-- examples for `tool_call` matcher semantics should use Pi-native tool names like `read`, `edit|write`, or custom names like `my_tool`
-- the loader should not assume a closed Codex-style whitelist of literal values
-- plain literals must be classified by syntax, then preserved for later exact matching against Pi's actual tool names
-
 ## How Codex loads hooks
 
 - Hook discovery is gated by a feature flag.
@@ -295,26 +255,37 @@ Implication for Pi Hooks:
 
 A concrete proof point is `core/tests/suite/hooks.rs::pre_tool_use_merges_hooks_json_and_config_toml()`, plus `hooks/src/engine/discovery.rs`, which shows the append order and the per-folder `visited_json_hook_folders` dedup.
 
-## Implication for Pi Hooks
+## Codex runtime call sites
 
-For Pi Hooks, the Codex pattern to copy is:
+Codex has a separate runtime host in `<root-directory>/codex-rs/core/src/hook_runtime.rs`, and the rest of the app calls into it at specific lifecycle seams.
 
-1. discover config files in deterministic order
-2. parse each `hooks.json`
-3. normalize all handlers once into an in-memory registry
-4. preserve configured order
-5. keep runtime event dispatch separate from config loading
+Concrete call sites:
 
-Pi should simplify by omitting TOML hook loading entirely.
+- turn start in `core/src/session/turn.rs`
+    - `run_pending_session_start_hooks()`
+- before input is recorded in `core/src/session/turn.rs`
+    - `inspect_pending_input()` via `run_hooks_and_record_inputs()`
+- after the model finishes a turn in `core/src/session/turn.rs`
+    - `run_turn_stop_hooks()`
+- before tool execution in `core/src/tools/registry.rs`
+    - `run_pre_tool_use_hooks()`
+- after successful tool execution in `core/src/tools/registry.rs`
+    - `run_post_tool_use_hooks()`
+- approval paths in:
+    - `core/src/tools/approvals.rs`
+    - `core/src/tools/network_approval.rs`
+    - `core/src/mcp_tool_call.rs`
+    - all call `run_permission_request_hooks()`
+- teardown in `core/src/session/handlers.rs`
+    - `run_session_end_hooks()`
 
-### Pi adaptation
+`hook_runtime.rs` exposes the main runtime entry points:
 
-- Keep `hooks.json` strict and JSON-only.
-- Use `pi-hooks.schema.json` as the canonical file-shape validator.
-- Load global `~/.pi/hooks.json` first, then project-local `.pi/hooks.json` files from root to leaf.
-- Append all discovered handlers in deterministic order.
-- Deduplicate only by exact file path so the same file is not loaded twice.
-- Normalize each discovered handler once into an in-memory registry.
-- Keep loader concerns separate from any later runtime dispatch concerns.
-- Treat a malformed `hooks.json` as a startup warning that skips the whole file.
-- Treat partially invalid handlers inside a valid file as per-entry warnings that skip only the bad entries.
+- `run_pending_session_start_hooks`
+- `run_pre_tool_use_hooks`
+- `run_permission_request_hooks`
+- `run_post_tool_use_hooks`
+- `run_turn_stop_hooks`
+- `run_session_end_hooks`
+- `run_pre_compact_hooks`
+- `run_post_compact_hooks`
