@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, realpath, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent"
@@ -23,6 +23,24 @@ function createExtensionApiDouble() {
     } as ExtensionAPI
 
     return { pi, handlers }
+}
+
+function getSessionStartHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.session_start as ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>) | undefined
+}
+
+function createNodeHookCommand(outputPath: string) {
+    return `node --input-type=module -e "import('node:fs').then(fs=>{let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{fs.writeFileSync(process.argv[1],input);});});" ${JSON.stringify(outputPath)}`
+}
+
+function createNodeCwdCommand(outputPath: string) {
+    return `node --input-type=module -e "import('node:fs').then(fs=>fs.writeFileSync(process.argv[1],process.cwd()));" ${JSON.stringify(outputPath)}`
+}
+
+function createExtensionContext(cwd: string) {
+    return { cwd } as ExtensionContext
 }
 
 describe("pi hooks loader", () => {
@@ -364,6 +382,249 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("runs session_start hooks from the refreshed registry with canonical payload in the session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "session-start-payload.json")
+        const skippedOutputPath = join(projectDir, "session-start-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            matcher: "startup",
+                            hooks: [{ type: "command", command: createNodeHookCommand(outputPath) }],
+                        },
+                        {
+                            matcher: "reload",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+
+            expect(sessionStart).toBeTypeOf("function")
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(getHookRegistry().files.map((file) => file.sourcePath)).toEqual([
+                join(canonicalProjectDir, ".pi", "hooks.json"),
+            ])
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; reason: string }
+                }
+
+                expect(payload).toEqual({
+                    event: "session_start",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["startup"] },
+                    payload: { type: "session_start", reason: "startup" },
+                })
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not block session_start on hook completion", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-session-start.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            matcher: "startup",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+
+            await expect(
+                sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toBeUndefined()
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports non-zero session_start hook exits without crashing session start", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            matcher: "startup",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.stdout.write('hook-out');process.stderr.write('hook-err');process.exit(7)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+
+            await expect(
+                sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-err"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("uses the active session cwd from the handler context for discovery and hook execution", async () => {
+        const homeDir = await makeTempHome()
+        const processDir = join(homeDir, "process-root")
+        const sessionDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(sessionDir, "ctx-cwd-value.txt")
+
+        await mkdir(join(processDir, ".pi"), { recursive: true })
+        await mkdir(join(sessionDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(processDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [{ hooks: [{ type: "command", command: 'node -e "process.exit(0)"' }] }],
+                },
+            }),
+        )
+        await writeFile(
+            join(sessionDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            matcher: "startup",
+                            hooks: [{ type: "command", command: createNodeCwdCommand(outputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProcessDir = await realpath(processDir)
+        const canonicalSessionDir = await realpath(sessionDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProcessDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalSessionDir),
+            )
+
+            expect(getHookRegistry().files.map((file) => file.sourcePath)).toEqual([
+                join(canonicalSessionDir, ".pi", "hooks.json"),
+            ])
+
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe(canonicalSessionDir)
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("loads the user-level hooks registry on session start", async () => {
         const homeDir = await makeTempHome()
         await writeFile(
@@ -389,13 +650,11 @@ describe("pi hooks loader", () => {
             const { pi, handlers } = createExtensionApiDouble()
             setup(pi)
 
-            const sessionStart = handlers.session_start as
-                | ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>)
-                | undefined
+            const sessionStart = getSessionStartHandler(handlers)
 
             expect(sessionStart).toBeTypeOf("function")
 
-            await sessionStart?.({ type: "session_start", reason: "startup" }, {} as ExtensionContext)
+            await sessionStart?.({ type: "session_start", reason: "startup" }, createExtensionContext(canonicalHomeDir))
             const expectedSourcePath = join(canonicalHomeDir, ".pi", "hooks.json")
 
             expect(getHookRegistry()).toEqual<HookRegistry>({
@@ -544,11 +803,12 @@ describe("pi hooks loader", () => {
             const { pi, handlers } = createExtensionApiDouble()
             setup(pi)
 
-            const sessionStart = handlers.session_start as
-                | ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>)
-                | undefined
+            const sessionStart = getSessionStartHandler(handlers)
 
-            await sessionStart?.({ type: "session_start", reason: "startup" }, {} as ExtensionContext)
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
 
             expect(getHookRegistry().files.map((file) => file.sourcePath)).toEqual([
                 join(canonicalHomeDir, ".pi", "hooks.json"),

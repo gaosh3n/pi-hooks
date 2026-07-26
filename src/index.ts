@@ -1,4 +1,5 @@
 import { Ajv2020 } from "ajv/dist/2020.js"
+import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { access, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -92,8 +93,9 @@ export function getHookRegistry(): HookRegistry {
 }
 
 export default function setup(pi: ExtensionAPI) {
-    pi.on("session_start", async (_event: SessionStartEvent, _ctx: ExtensionContext) => {
-        activeRegistry = await loadHooksRegistry()
+    pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
+        activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
+        dispatchSessionStartHooks(event, ctx)
     })
 }
 
@@ -318,6 +320,95 @@ function normalizeHook(value: JsonValue): LoadedHook {
         ...(value.timeout === undefined ? {} : { timeout: value.timeout as number }),
         ...(value.statusMessage === undefined ? {} : { statusMessage: value.statusMessage as string }),
     }
+}
+
+function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionContext) {
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "session_start") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesSessionStartReason(matcherGroup.normalizedMatcher, event.reason)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                    }).catch((error: unknown) => {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
+function matchesSessionStartReason(matcher: LoadedMatcher, reason: SessionStartEvent["reason"]) {
+    if (matcher.kind === "all") {
+        return true
+    }
+
+    if (matcher.kind === "exact") {
+        return matcher.values.includes(reason)
+    }
+
+    return new RegExp(matcher.pattern).test(reason)
+}
+
+async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload: JsonObject }) {
+    const child = spawn(options.hook.command, {
+        cwd: options.cwd,
+        env: process.env,
+        shell: true,
+        stdio: ["pipe", "pipe", "pipe"],
+    })
+
+    const stdoutChunks: Uint8Array[] = []
+    const stderrChunks: Uint8Array[] = []
+
+    child.stdout.on("data", (chunk: Uint8Array) => {
+        stdoutChunks.push(chunk)
+    })
+    child.stderr.on("data", (chunk: Uint8Array) => {
+        stderrChunks.push(chunk)
+    })
+
+    child.stdin.end(JSON.stringify(options.payload))
+
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+        child.on("error", reject)
+        child.on("close", resolve)
+    })
+
+    if (exitCode === 0) {
+        return
+    }
+
+    const stdout = Buffer.concat(stdoutChunks).toString("utf8")
+    const stderr = Buffer.concat(stderrChunks).toString("utf8")
+    console.warn(
+        `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
+    )
+}
+
+function serializeJsonObject(value: unknown): JsonObject {
+    return JSON.parse(JSON.stringify(value)) as JsonObject
+}
+
+function toErrorMessage(error: unknown) {
+    return error instanceof Error ? error.message : String(error)
 }
 
 function isJsonObject(value: JsonValue | undefined): value is JsonObject {

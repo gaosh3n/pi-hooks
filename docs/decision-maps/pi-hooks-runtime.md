@@ -39,10 +39,19 @@ For each supported Pi event, what concrete event field does a `matcher` evaluate
 
 Resolved.
 
-`matcher` should remain event-specific at runtime. Pi Hooks should only evaluate a matcher against a single, obvious string subject when the Pi event exposes one. Otherwise the event is match-all only and any configured matcher should be warned about and ignored.
+`matcher` should remain event-specific at runtime. Pi Hooks should evaluate a matcher against one documented, stable scalar string field when the Pi event exposes one. If an event does not expose that kind of field, the event is match-all only and any configured matcher should be warned about and ignored.
 
-Runtime matcher subjects for the first slice:
+Runtime matcher subjects for the first runtime work:
 
+- `project_trust` → `event.cwd`
+- `resources_discover` → `event.reason`
+- `session_start` → `event.reason`
+- `session_before_switch` → `event.reason`
+- `session_before_compact` → `event.reason`
+- `session_compact` → `event.reason`
+- `session_shutdown` → `event.reason`
+- `model_select` → `event.source`
+- `thinking_level_select` → `event.level`
 - `tool_call` → `event.toolName`
 - `tool_result` → `event.toolName`
 - `tool_execution_start` → `event.toolName`
@@ -52,16 +61,17 @@ Runtime matcher subjects for the first slice:
 - `input` → `event.text`
 - `before_agent_start` → `event.prompt`
 
-All currently schema-defined events are runtime-supported in the first slice, but every event not listed above is match-all only.
+All currently schema-defined events are runtime-supported in the first runtime work, but every event not listed above is match-all only.
 
-That means those events should ignore configured matchers with a warning rather than inventing ad hoc subjects such as cwd, session reason, status code, or serialized payload blobs.
+That means Pi Hooks should use Pi-native event-specific subjects such as session reason, selection source, thinking level, tool name, prompt text, input text, bash command, or project cwd when Pi exposes them. Pi Hooks should still warn and ignore configured matchers for events that do not expose a suitable scalar subject, rather than inventing ad hoc subjects from optional fields, numeric fields, object blobs, or serialized payloads.
 
 Rationale:
 
-- Pi-native tool events already expose a stable string subject: `toolName`
-- Pi-native input events already expose a stable string subject: `text` / `prompt`
-- many lifecycle events are notifications, not natural matcher targets
-- keeping unsupported events as match-all only avoids a fake generality that would be hard to document and reason about later
+- Codex also uses event-specific matcher subjects rather than one global rule
+- Pi-native session and selection events expose meaningful scalar discriminators such as `reason`, `source`, and `level`
+- Pi-native tool and text events expose stable string subjects such as `toolName`, `command`, `text`, and `prompt`
+- `project_trust` is naturally about a concrete project cwd, so `event.cwd` is the Pi-native subject there
+- events without a documented stable scalar subject should remain match-all only to avoid fake generality that would be hard to document and reason about later
 
 ## #3: What is the command-hook execution contract?
 
@@ -124,7 +134,7 @@ Pi’s native extension API does support richer behavior in TypeScript handlers:
 
 But those capabilities belong to Pi’s native extension handler model, not automatically to declarative `hooks.json` command hooks.
 
-For Pi Hooks v1:
+For Pi Hooks in this first runtime work:
 
 - command hooks may observe lifecycle events
 - command hooks may succeed, fail, timeout, and emit diagnostics
@@ -182,6 +192,6 @@ For policy-like use cases:
 
 - trust decisions belong to Pi’s native `project_trust` event
 - tool-approval or tool-blocking behavior belongs to Pi’s native `tool_call` event
-- command hooks in Pi Hooks v1 remain observe-only and therefore do not replace either of those native pathways
+- command hooks in this first runtime work remain observe-only and therefore do not replace either of those native pathways
 
 Codex’s `PermissionRequest` hooks are useful reference for where policy hooks may matter, but Pi already exposes the relevant lifecycle seams differently. Pi Hooks should map onto those existing Pi events rather than create a parallel approval abstraction.
