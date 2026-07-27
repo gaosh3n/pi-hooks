@@ -6,7 +6,13 @@ import { homedir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { ErrorObject, ValidateFunction } from "ajv"
-import type { ExtensionAPI, ExtensionContext, SessionStartEvent, ToolCallEvent } from "@earendil-works/pi-coding-agent"
+import type {
+    ExtensionAPI,
+    ExtensionContext,
+    SessionStartEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+} from "@earendil-works/pi-coding-agent"
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 type JsonObject = { [key: string]: JsonValue }
@@ -18,6 +24,36 @@ type SchemaDocument = {
         }
     }
 }
+
+type ToolExecutionStartEvent = {
+    type: "tool_execution_start"
+    toolCallId: string
+    toolName: string
+    args: unknown
+}
+
+type ToolExecutionUpdateEvent = {
+    type: "tool_execution_update"
+    toolCallId: string
+    toolName: string
+    args: unknown
+    partialResult: unknown
+}
+
+type ToolExecutionEndEvent = {
+    type: "tool_execution_end"
+    toolCallId: string
+    toolName: string
+    result: unknown
+    isError: boolean
+}
+
+type ToolNamedRuntimeEvent =
+    | ToolCallEvent
+    | ToolResultEvent
+    | ToolExecutionStartEvent
+    | ToolExecutionUpdateEvent
+    | ToolExecutionEndEvent
 
 export interface LoadedHook {
     enabled: true
@@ -100,6 +136,22 @@ export default function setup(pi: ExtensionAPI) {
 
     pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) => {
         dispatchToolCallHooks(event, ctx)
+    })
+
+    pi.on("tool_result", (event: ToolResultEvent, ctx: ExtensionContext) => {
+        dispatchToolResultHooks(event, ctx)
+    })
+
+    pi.on("tool_execution_start", (event: ToolExecutionStartEvent, ctx: ExtensionContext) => {
+        dispatchToolExecutionStartHooks(event, ctx)
+    })
+
+    pi.on("tool_execution_update", (event: ToolExecutionUpdateEvent, ctx: ExtensionContext) => {
+        dispatchToolExecutionUpdateHooks(event, ctx)
+    })
+
+    pi.on("tool_execution_end", (event: ToolExecutionEndEvent, ctx: ExtensionContext) => {
+        dispatchToolExecutionEndHooks(event, ctx)
     })
 }
 
@@ -360,9 +412,33 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
 }
 
 function dispatchToolCallHooks(event: ToolCallEvent, ctx: ExtensionContext) {
+    dispatchToolNamedHooks("tool_call", event, ctx)
+}
+
+function dispatchToolResultHooks(event: ToolResultEvent, ctx: ExtensionContext) {
+    dispatchToolNamedHooks("tool_result", event, ctx)
+}
+
+function dispatchToolExecutionStartHooks(event: ToolExecutionStartEvent, ctx: ExtensionContext) {
+    dispatchToolNamedHooks("tool_execution_start", event, ctx)
+}
+
+function dispatchToolExecutionUpdateHooks(event: ToolExecutionUpdateEvent, ctx: ExtensionContext) {
+    dispatchToolNamedHooks("tool_execution_update", event, ctx)
+}
+
+function dispatchToolExecutionEndHooks(event: ToolExecutionEndEvent, ctx: ExtensionContext) {
+    dispatchToolNamedHooks("tool_execution_end", event, ctx)
+}
+
+function dispatchToolNamedHooks(
+    eventName: "tool_call" | "tool_result" | "tool_execution_start" | "tool_execution_update" | "tool_execution_end",
+    event: ToolNamedRuntimeEvent,
+    ctx: ExtensionContext,
+) {
     for (const file of activeRegistry.files) {
         for (const registration of file.events) {
-            if (registration.eventName !== "tool_call") {
+            if (registration.eventName !== eventName) {
                 continue
             }
 

@@ -1,9 +1,38 @@
 import { mkdtemp, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { ExtensionAPI, ExtensionContext, SessionStartEvent, ToolCallEvent } from "@earendil-works/pi-coding-agent"
+import type {
+    ExtensionAPI,
+    ExtensionContext,
+    SessionStartEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+} from "@earendil-works/pi-coding-agent"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import setup, { getHookRegistry, loadHooksRegistry, loadUserHooksRegistry, type HookRegistry } from "../src/index.ts"
+
+type ToolExecutionStartEvent = {
+    type: "tool_execution_start"
+    toolCallId: string
+    toolName: string
+    args: unknown
+}
+
+type ToolExecutionUpdateEvent = {
+    type: "tool_execution_update"
+    toolCallId: string
+    toolName: string
+    args: unknown
+    partialResult: unknown
+}
+
+type ToolExecutionEndEvent = {
+    type: "tool_execution_end"
+    toolCallId: string
+    toolName: string
+    result: unknown
+    isError: boolean
+}
 
 const tempDirs: string[] = []
 
@@ -35,6 +64,38 @@ function getToolCallHandler(
     handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
 ) {
     return handlers.tool_call as ((event: ToolCallEvent, ctx: ExtensionContext) => Promise<void>) | undefined
+}
+
+function getToolResultHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.tool_result as
+        | ((event: ToolResultEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getToolExecutionStartHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.tool_execution_start as
+        | ((event: ToolExecutionStartEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getToolExecutionUpdateHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.tool_execution_update as
+        | ((event: ToolExecutionUpdateEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getToolExecutionEndHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.tool_execution_end as
+        | ((event: ToolExecutionEndEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
 }
 
 function createNodeHookCommand(outputPath: string) {
@@ -657,6 +718,106 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("runs matching tool_result hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "tool-result-payload.json")
+        const cwdOutputPath = join(projectDir, "tool-result-cwd.txt")
+        const skippedOutputPath = join(projectDir, "tool-result-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "write",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(toolResult).toBeTypeOf("function")
+
+            await toolResult?.(
+                {
+                    type: "tool_result",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    input: { path: "README.md" },
+                    content: [{ type: "text", text: "hello" }],
+                    isError: false,
+                    details: undefined,
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        toolName: string
+                        toolCallId: string
+                        input: { path: string }
+                        content: [{ type: string; text: string }]
+                        isError: boolean
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "tool_result",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["read"] },
+                    payload: {
+                        type: "tool_result",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        input: { path: "README.md" },
+                        content: [{ type: "text", text: "hello" }],
+                        isError: false,
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("does not block tool_call on hook completion", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
@@ -790,6 +951,227 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("does not block or mutate tool_result handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-tool-result.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 5,
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: ToolResultEvent = {
+                type: "tool_result",
+                toolCallId: "call-1",
+                toolName: "read",
+                input: { path: "README.md" },
+                content: [{ type: "text", text: "hello" }],
+                isError: false,
+                details: undefined,
+            }
+
+            expect(toolResult?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            expect(event).toEqual({
+                type: "tool_result",
+                toolCallId: "call-1",
+                toolName: "read",
+                input: { path: "README.md" },
+                content: [{ type: "text", text: "hello" }],
+                isError: false,
+                details: undefined,
+            })
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching tool_execution lifecycle hooks with canonical payloads in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const startOutputPath = join(projectDir, "tool-execution-start-payload.json")
+        const updateOutputPath = join(projectDir, "tool-execution-update-payload.json")
+        const endOutputPath = join(projectDir, "tool-execution-end-payload.json")
+        const cwdOutputPath = join(projectDir, "tool-execution-cwd.txt")
+        const skippedOutputPath = join(projectDir, "tool-execution-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_execution_start: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(startOutputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                    ],
+                    tool_execution_update: [
+                        {
+                            matcher: "read",
+                            hooks: [{ type: "command", command: createNodeHookCommand(updateOutputPath) }],
+                        },
+                    ],
+                    tool_execution_end: [
+                        {
+                            matcher: "read",
+                            hooks: [{ type: "command", command: createNodeHookCommand(endOutputPath) }],
+                        },
+                        {
+                            matcher: "write",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolExecutionStart = getToolExecutionStartHandler(handlers)
+            const toolExecutionUpdate = getToolExecutionUpdateHandler(handlers)
+            const toolExecutionEnd = getToolExecutionEndHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(toolExecutionStart).toBeTypeOf("function")
+            expect(toolExecutionUpdate).toBeTypeOf("function")
+            expect(toolExecutionEnd).toBeTypeOf("function")
+
+            await toolExecutionStart?.(
+                {
+                    type: "tool_execution_start",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    args: { path: "README.md" },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+            await toolExecutionUpdate?.(
+                {
+                    type: "tool_execution_update",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    args: { path: "README.md" },
+                    partialResult: { chunk: "hello" },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+            await toolExecutionEnd?.(
+                {
+                    type: "tool_execution_end",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    result: { ok: true },
+                    isError: false,
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                expect(JSON.parse(await readFile(startOutputPath, "utf8"))).toEqual({
+                    event: "tool_execution_start",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["read"] },
+                    payload: {
+                        type: "tool_execution_start",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        args: { path: "README.md" },
+                    },
+                })
+
+                expect(JSON.parse(await readFile(updateOutputPath, "utf8"))).toEqual({
+                    event: "tool_execution_update",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["read"] },
+                    payload: {
+                        type: "tool_execution_update",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        args: { path: "README.md" },
+                        partialResult: { chunk: "hello" },
+                    },
+                })
+
+                expect(JSON.parse(await readFile(endOutputPath, "utf8"))).toEqual({
+                    event: "tool_execution_end",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["read"] },
+                    payload: {
+                        type: "tool_execution_end",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        result: { ok: true },
+                        isError: false,
+                    },
+                })
+
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("reports timed out tool_call hooks without crashing tool execution", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
@@ -842,6 +1224,143 @@ describe("pi hooks loader", () => {
                         toolCallId: "call-1",
                         toolName: "read",
                         input: { path: "README.md" },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports non-zero tool_result hook exits without crashing tool result handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.stdout.write('hook-out');process.stderr.write('hook-err');process.exit(7)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                toolResult?.(
+                    {
+                        type: "tool_result",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        input: { path: "README.md" },
+                        content: [{ type: "text", text: "hello" }],
+                        isError: false,
+                        details: undefined,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-err"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports timed out tool_execution_update hooks without crashing tool lifecycle", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_execution_update: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 0.05,
+                                    command: `node --input-type=module -e "setTimeout(()=>process.exit(0),200)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolExecutionUpdate = getToolExecutionUpdateHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                toolExecutionUpdate?.(
+                    {
+                        type: "tool_execution_update",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        args: { path: "README.md" },
+                        partialResult: { chunk: "hello" },
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
