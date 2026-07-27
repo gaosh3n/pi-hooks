@@ -6,7 +6,7 @@ import { homedir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { ErrorObject, ValidateFunction } from "ajv"
-import type { ExtensionAPI, ExtensionContext, SessionStartEvent } from "@earendil-works/pi-coding-agent"
+import type { ExtensionAPI, ExtensionContext, SessionStartEvent, ToolCallEvent } from "@earendil-works/pi-coding-agent"
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 type JsonObject = { [key: string]: JsonValue }
@@ -96,6 +96,10 @@ export default function setup(pi: ExtensionAPI) {
     pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
         activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
         dispatchSessionStartHooks(event, ctx)
+    })
+
+    pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) => {
+        dispatchToolCallHooks(event, ctx)
     })
 }
 
@@ -355,16 +359,53 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
     }
 }
 
+function dispatchToolCallHooks(event: ToolCallEvent, ctx: ExtensionContext) {
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "tool_call") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.toolName)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                    }).catch((error: unknown) => {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
 function matchesSessionStartReason(matcher: LoadedMatcher, reason: SessionStartEvent["reason"]) {
+    return matchesLoadedMatcher(matcher, reason)
+}
+
+function matchesLoadedMatcher(matcher: LoadedMatcher, value: string) {
     if (matcher.kind === "all") {
         return true
     }
 
     if (matcher.kind === "exact") {
-        return matcher.values.includes(reason)
+        return matcher.values.includes(value)
     }
 
-    return new RegExp(matcher.pattern).test(reason)
+    return new RegExp(matcher.pattern).test(value)
 }
 
 async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload: JsonObject }) {
@@ -377,6 +418,16 @@ async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload:
 
     const stdoutChunks: Uint8Array[] = []
     const stderrChunks: Uint8Array[] = []
+    let timedOut = false
+    const timeoutMilliseconds =
+        options.hook.timeout === undefined ? undefined : Math.max(0, options.hook.timeout * 1000)
+    const timeoutHandle =
+        timeoutMilliseconds === undefined
+            ? undefined
+            : setTimeout(() => {
+                  timedOut = true
+                  child.kill()
+              }, timeoutMilliseconds)
 
     child.stdout.on("data", (chunk: Uint8Array) => {
         stdoutChunks.push(chunk)
@@ -388,16 +439,34 @@ async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload:
     child.stdin.end(JSON.stringify(options.payload))
 
     const exitCode = await new Promise<number | null>((resolve, reject) => {
-        child.on("error", reject)
-        child.on("close", resolve)
+        child.on("error", (error) => {
+            if (timeoutHandle !== undefined) {
+                clearTimeout(timeoutHandle)
+            }
+            reject(error)
+        })
+        child.on("close", (code) => {
+            if (timeoutHandle !== undefined) {
+                clearTimeout(timeoutHandle)
+            }
+            resolve(code)
+        })
     })
+
+    const stdout = Buffer.concat(stdoutChunks).toString("utf8")
+    const stderr = Buffer.concat(stderrChunks).toString("utf8")
+
+    if (timedOut) {
+        console.warn(
+            `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
+        )
+        return
+    }
 
     if (exitCode === 0) {
         return
     }
 
-    const stdout = Buffer.concat(stdoutChunks).toString("utf8")
-    const stderr = Buffer.concat(stderrChunks).toString("utf8")
     console.warn(
         `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
     )
