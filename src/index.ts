@@ -25,6 +25,21 @@ type SchemaDocument = {
     }
 }
 
+type BeforeAgentStartEvent = {
+    type: "before_agent_start"
+    prompt: string
+    images?: unknown[]
+    systemPrompt: string
+    systemPromptOptions: unknown
+}
+
+type UserBashEvent = {
+    type: "user_bash"
+    command: string
+    excludeFromContext: boolean
+    cwd: string
+}
+
 type InputEvent = {
     type: "input"
     text: string
@@ -142,8 +157,16 @@ export default function setup(pi: ExtensionAPI) {
         dispatchSessionStartHooks(event, ctx)
     })
 
+    pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
+        dispatchBeforeAgentStartHooks(event, ctx)
+    })
+
     pi.on("input", (event: InputEvent, ctx: ExtensionContext) => {
         dispatchInputHooks(event, ctx)
+    })
+
+    pi.on("user_bash", (event: UserBashEvent, ctx: ExtensionContext) => {
+        dispatchUserBashHooks(event, ctx)
     })
 
     pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) => {
@@ -423,30 +446,74 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
     }
 }
 
+function dispatchBeforeAgentStartHooks(event: BeforeAgentStartEvent, ctx: ExtensionContext) {
+    dispatchTextMatchedHooks({
+        eventName: "before_agent_start",
+        event,
+        subject: event.prompt,
+        ctx,
+        reportFailures: true,
+    })
+}
+
 function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext) {
+    dispatchTextMatchedHooks({
+        eventName: "input",
+        event,
+        subject: event.text,
+        ctx,
+        reportFailures: false,
+    })
+}
+
+function dispatchUserBashHooks(event: UserBashEvent, ctx: ExtensionContext) {
+    dispatchTextMatchedHooks({
+        eventName: "user_bash",
+        event,
+        subject: event.command,
+        ctx,
+        reportFailures: true,
+    })
+}
+
+function dispatchTextMatchedHooks(options: {
+    eventName: "before_agent_start" | "input" | "user_bash"
+    event: BeforeAgentStartEvent | InputEvent | UserBashEvent
+    subject: string
+    ctx: ExtensionContext
+    reportFailures: boolean
+}) {
     for (const file of activeRegistry.files) {
         for (const registration of file.events) {
-            if (registration.eventName !== "input") {
+            if (registration.eventName !== options.eventName) {
                 continue
             }
 
             for (const matcherGroup of registration.matcherGroups) {
-                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.text)) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, options.subject)) {
                     continue
                 }
 
                 for (const hook of matcherGroup.hooks) {
                     void runCommandHook({
                         hook,
-                        cwd: ctx.cwd,
+                        cwd: options.ctx.cwd,
                         payload: {
                             event: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
+                            payload: serializeJsonObject(options.event),
                         },
-                        reportFailures: false,
-                    }).catch(() => {})
+                        reportFailures: options.reportFailures,
+                    }).catch((error: unknown) => {
+                        if (!options.reportFailures) {
+                            return
+                        }
+
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
                 }
             }
         }

@@ -11,6 +11,21 @@ import type {
 import { afterEach, describe, expect, it, vi } from "vitest"
 import setup, { getHookRegistry, loadHooksRegistry, loadUserHooksRegistry, type HookRegistry } from "../src/index.ts"
 
+type BeforeAgentStartEvent = {
+    type: "before_agent_start"
+    prompt: string
+    images?: unknown[]
+    systemPrompt: string
+    systemPromptOptions: unknown
+}
+
+type UserBashEvent = {
+    type: "user_bash"
+    command: string
+    excludeFromContext: boolean
+    cwd: string
+}
+
 type InputEvent = {
     type: "input"
     text: string
@@ -66,6 +81,22 @@ function getSessionStartHandler(
     handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
 ) {
     return handlers.session_start as ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>) | undefined
+}
+
+function getBeforeAgentStartHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.before_agent_start as
+        | ((event: BeforeAgentStartEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getUserBashHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.user_bash as
+        | ((event: UserBashEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
 }
 
 function getInputHandler(
@@ -636,6 +667,530 @@ describe("pi hooks loader", () => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-err"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching before_agent_start hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "before-agent-start-payload.json")
+        const cwdOutputPath = join(projectDir, "before-agent-start-cwd.txt")
+        const skippedOutputPath = join(projectDir, "before-agent-start-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "goodbye",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(beforeAgentStart).toBeTypeOf("function")
+
+            await beforeAgentStart?.(
+                {
+                    type: "before_agent_start",
+                    prompt: "hello world",
+                    systemPrompt: "You are Pi.",
+                    systemPromptOptions: { cwd: canonicalProjectDir },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        prompt: string
+                        systemPrompt: string
+                        systemPromptOptions: { cwd: string }
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "before_agent_start",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["hello world"] },
+                    payload: {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching user_bash hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "user-bash-payload.json")
+        const cwdOutputPath = join(projectDir, "user-bash-cwd.txt")
+        const skippedOutputPath = join(projectDir, "user-bash-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    user_bash: [
+                        {
+                            matcher: "npm test",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "pnpm lint",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const userBash = getUserBashHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(userBash).toBeTypeOf("function")
+
+            await userBash?.(
+                {
+                    type: "user_bash",
+                    command: "npm test",
+                    excludeFromContext: false,
+                    cwd: canonicalProjectDir,
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        command: string
+                        excludeFromContext: boolean
+                        cwd: string
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "user_bash",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["npm test"] },
+                    payload: {
+                        type: "user_bash",
+                        command: "npm test",
+                        excludeFromContext: false,
+                        cwd: canonicalProjectDir,
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not block or mutate before_agent_start handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-before-agent-start.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 5,
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: BeforeAgentStartEvent = {
+                type: "before_agent_start",
+                prompt: "hello world",
+                systemPrompt: "You are Pi.",
+                systemPromptOptions: { cwd: canonicalProjectDir },
+            }
+
+            expect(beforeAgentStart?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            expect(event).toEqual({
+                type: "before_agent_start",
+                prompt: "hello world",
+                systemPrompt: "You are Pi.",
+                systemPromptOptions: { cwd: canonicalProjectDir },
+            })
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not block or replace user_bash handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-user-bash.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    user_bash: [
+                        {
+                            matcher: "npm test",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 5,
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const userBash = getUserBashHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: UserBashEvent = {
+                type: "user_bash",
+                command: "npm test",
+                excludeFromContext: false,
+                cwd: canonicalProjectDir,
+            }
+
+            expect(userBash?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            expect(event).toEqual({
+                type: "user_bash",
+                command: "npm test",
+                excludeFromContext: false,
+                cwd: canonicalProjectDir,
+            })
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports non-zero before_agent_start hook exits without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.stdout.write('hook-out');process.stderr.write('hook-err');process.exit(7)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                beforeAgentStart?.(
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-err"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports timed out user_bash hooks without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    user_bash: [
+                        {
+                            matcher: "npm test",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 0.05,
+                                    command: `node --input-type=module -e "setTimeout(()=>process.exit(0),200)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const userBash = getUserBashHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                userBash?.(
+                    {
+                        type: "user_bash",
+                        command: "npm test",
+                        excludeFromContext: false,
+                        cwd: canonicalProjectDir,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out after 0.05s"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("node --input-type=module"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports before_agent_start hook spawn failures without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.exit(0)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                beforeAgentStart?.(
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
+                expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i))
             })
         } finally {
             warn.mockRestore()
