@@ -25,6 +25,14 @@ type SchemaDocument = {
     }
 }
 
+type InputEvent = {
+    type: "input"
+    text: string
+    images?: unknown[]
+    source: "interactive" | "rpc" | "extension"
+    streamingBehavior?: "steer" | "followUp"
+}
+
 type ToolExecutionStartEvent = {
     type: "tool_execution_start"
     toolCallId: string
@@ -132,6 +140,10 @@ export default function setup(pi: ExtensionAPI) {
     pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
         activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
         dispatchSessionStartHooks(event, ctx)
+    })
+
+    pi.on("input", (event: InputEvent, ctx: ExtensionContext) => {
+        dispatchInputHooks(event, ctx)
     })
 
     pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) => {
@@ -411,6 +423,36 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
     }
 }
 
+function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext) {
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "input") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.text)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                        reportFailures: false,
+                    }).catch(() => {})
+                }
+            }
+        }
+    }
+}
+
 function dispatchToolCallHooks(event: ToolCallEvent, ctx: ExtensionContext) {
     dispatchToolNamedHooks("tool_call", event, ctx)
 }
@@ -484,7 +526,12 @@ function matchesLoadedMatcher(matcher: LoadedMatcher, value: string) {
     return new RegExp(matcher.pattern).test(value)
 }
 
-async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload: JsonObject }) {
+async function runCommandHook(options: {
+    hook: LoadedHook
+    cwd: string
+    payload: JsonObject
+    reportFailures?: boolean
+}) {
     const child = spawn(options.hook.command, {
         cwd: options.cwd,
         env: process.env,
@@ -531,11 +578,14 @@ async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload:
 
     const stdout = Buffer.concat(stdoutChunks).toString("utf8")
     const stderr = Buffer.concat(stderrChunks).toString("utf8")
+    const reportFailures = options.reportFailures ?? true
 
     if (timedOut) {
-        console.warn(
-            `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
-        )
+        if (reportFailures) {
+            console.warn(
+                `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
+            )
+        }
         return
     }
 
@@ -543,9 +593,11 @@ async function runCommandHook(options: { hook: LoadedHook; cwd: string; payload:
         return
     }
 
-    console.warn(
-        `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
-    )
+    if (reportFailures) {
+        console.warn(
+            `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
+        )
+    }
 }
 
 function serializeJsonObject(value: unknown): JsonObject {
