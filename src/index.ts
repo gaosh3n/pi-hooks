@@ -1,5 +1,5 @@
 import { Ajv2020 } from "ajv/dist/2020.js"
-import { spawn } from "node:child_process"
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { access, readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -160,8 +160,17 @@ export interface HookRegistry {
     files: LoadedHooksFile[]
 }
 
+type HookCancellationReason = "abort" | "shutdown" | "timeout"
+
+type ActiveHookExecution = {
+    child: ChildProcessWithoutNullStreams
+    cancellationReason: HookCancellationReason | undefined
+    clearAbortListener: (() => void) | undefined
+}
+
 const EMPTY_REGISTRY: HookRegistry = { files: [] }
 let activeRegistry: HookRegistry = EMPTY_REGISTRY
+let activeHookExecutions = new Set<ActiveHookExecution>()
 
 const hooksSchema = loadHooksSchema()
 const validateHooksSchema = compileHooksSchemaValidator(hooksSchema)
@@ -226,7 +235,10 @@ export default function setup(pi: ExtensionAPI) {
     })
 
     pi.on("session_shutdown", (event: SessionShutdownEvent, ctx: ExtensionContext) => {
-        dispatchSessionShutdownHooks(event, ctx)
+        const registryAtShutdown = activeRegistry
+        activeRegistry = EMPTY_REGISTRY
+        cancelActiveHookExecutions("shutdown")
+        dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
     })
 
     pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
@@ -489,6 +501,22 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
     dispatchReasonMatchedHooks("session_start", event, ctx)
 }
 
+function cancelActiveHookExecutions(reason: HookCancellationReason) {
+    const executions = [...activeHookExecutions]
+    activeHookExecutions = new Set()
+
+    for (const execution of executions) {
+        if (execution.cancellationReason !== undefined) {
+            continue
+        }
+
+        execution.cancellationReason = reason
+        execution.clearAbortListener?.()
+        execution.clearAbortListener = undefined
+        execution.child.kill()
+    }
+}
+
 function dispatchResourcesDiscoverHooks(event: ResourcesDiscoverEvent, ctx: ExtensionContext) {
     dispatchReasonMatchedHooks("resources_discover", event, ctx)
 }
@@ -505,16 +533,21 @@ function dispatchSessionCompactHooks(event: SessionCompactEvent, ctx: ExtensionC
     dispatchReasonMatchedHooks("session_compact", event, ctx)
 }
 
-function dispatchSessionShutdownHooks(event: SessionShutdownEvent, ctx: ExtensionContext) {
-    dispatchReasonMatchedHooks("session_shutdown", event, ctx)
+function dispatchSessionShutdownHooks(
+    event: SessionShutdownEvent,
+    ctx: ExtensionContext,
+    registry: HookRegistry = activeRegistry,
+) {
+    dispatchReasonMatchedHooks("session_shutdown", event, ctx, registry)
 }
 
 function dispatchReasonMatchedHooks(
     eventName: ReasonMatchedEventName,
     event: ReasonMatchedRuntimeEvent,
     ctx: ExtensionContext,
+    registry: HookRegistry = activeRegistry,
 ) {
-    for (const file of activeRegistry.files) {
+    for (const file of registry.files) {
         for (const registration of file.events) {
             if (registration.eventName !== eventName) {
                 continue
@@ -535,6 +568,7 @@ function dispatchReasonMatchedHooks(
                             matcher: matcherGroup.normalizedMatcher,
                             payload: serializeJsonObject(event),
                         },
+                        abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -605,6 +639,7 @@ function dispatchTextMatchedHooks(options: {
                             payload: serializeJsonObject(options.event),
                         },
                         reportFailures: options.reportFailures,
+                        abortSignal: getHookAbortSignal(options.event, options.ctx),
                     }).catch((error: unknown) => {
                         if (!options.reportFailures) {
                             return
@@ -666,6 +701,7 @@ function dispatchToolNamedHooks(
                             matcher: matcherGroup.normalizedMatcher,
                             payload: serializeJsonObject(event),
                         },
+                        abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -689,11 +725,25 @@ function matchesLoadedMatcher(matcher: LoadedMatcher, value: string) {
     return new RegExp(matcher.pattern).test(value)
 }
 
+function getHookAbortSignal(event: unknown, ctx: ExtensionContext) {
+    const eventSignalCandidate = (event as { signal?: unknown }).signal
+    if (isAbortSignal(eventSignalCandidate)) {
+        return eventSignalCandidate
+    }
+
+    return ctx.signal
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+    return typeof value === "object" && value !== null && "aborted" in value && "addEventListener" in value
+}
+
 async function runCommandHook(options: {
     hook: LoadedHook
     cwd: string
     payload: JsonObject
     reportFailures?: boolean
+    abortSignal?: AbortSignal
 }) {
     const child = spawn(options.hook.command, {
         cwd: options.cwd,
@@ -704,16 +754,56 @@ async function runCommandHook(options: {
 
     const stdoutChunks: Uint8Array[] = []
     const stderrChunks: Uint8Array[] = []
-    let timedOut = false
+    const reportFailures = options.reportFailures ?? true
+    const activeExecution: ActiveHookExecution = {
+        child,
+        cancellationReason: undefined,
+        clearAbortListener: undefined,
+    }
+    activeHookExecutions.add(activeExecution)
+
     const timeoutMilliseconds =
         options.hook.timeout === undefined ? undefined : Math.max(0, options.hook.timeout * 1000)
     const timeoutHandle =
         timeoutMilliseconds === undefined
             ? undefined
             : setTimeout(() => {
-                  timedOut = true
+                  if (activeExecution.cancellationReason !== undefined) {
+                      return
+                  }
+
+                  activeExecution.cancellationReason = "timeout"
                   child.kill()
               }, timeoutMilliseconds)
+
+    const clearExecution = () => {
+        activeHookExecutions.delete(activeExecution)
+        activeExecution.clearAbortListener?.()
+        activeExecution.clearAbortListener = undefined
+        if (timeoutHandle !== undefined) {
+            clearTimeout(timeoutHandle)
+        }
+    }
+
+    if (options.abortSignal !== undefined) {
+        const abortHook = () => {
+            if (activeExecution.cancellationReason !== undefined) {
+                return
+            }
+
+            activeExecution.cancellationReason = "abort"
+            child.kill()
+        }
+
+        if (options.abortSignal.aborted) {
+            abortHook()
+        } else {
+            options.abortSignal.addEventListener("abort", abortHook, { once: true })
+            activeExecution.clearAbortListener = () => {
+                options.abortSignal?.removeEventListener("abort", abortHook)
+            }
+        }
+    }
 
     child.stdout.on("data", (chunk: Uint8Array) => {
         stdoutChunks.push(chunk)
@@ -724,21 +814,15 @@ async function runCommandHook(options: {
 
     const exitCode = await new Promise<number | null>((resolve, reject) => {
         child.on("error", (error) => {
-            if (timeoutHandle !== undefined) {
-                clearTimeout(timeoutHandle)
-            }
+            clearExecution()
             reject(error)
         })
         child.stdin.on("error", (error) => {
-            if (timeoutHandle !== undefined) {
-                clearTimeout(timeoutHandle)
-            }
+            clearExecution()
             reject(error)
         })
         child.on("close", (code) => {
-            if (timeoutHandle !== undefined) {
-                clearTimeout(timeoutHandle)
-            }
+            clearExecution()
             resolve(code)
         })
 
@@ -747,14 +831,24 @@ async function runCommandHook(options: {
 
     const stdout = Buffer.concat(stdoutChunks).toString("utf8")
     const stderr = Buffer.concat(stderrChunks).toString("utf8")
-    const reportFailures = options.reportFailures ?? true
 
-    if (timedOut) {
+    if (activeExecution.cancellationReason === "timeout") {
         if (reportFailures) {
             console.warn(
                 `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
             )
         }
+        return
+    }
+
+    if (activeExecution.cancellationReason === "abort") {
+        if (reportFailures) {
+            console.warn(`Hook command aborted: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`)
+        }
+        return
+    }
+
+    if (activeExecution.cancellationReason === "shutdown") {
         return
     }
 

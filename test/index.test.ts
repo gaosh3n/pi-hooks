@@ -227,8 +227,12 @@ function createNodeCwdCommand(outputPath: string) {
     return `node --input-type=module -e "import('node:fs').then(fs=>fs.writeFileSync(process.argv[1],process.cwd()));" ${JSON.stringify(outputPath)}`
 }
 
-function createExtensionContext(cwd: string) {
-    return { cwd } as ExtensionContext
+function createLongRunningHookCommand(options: { startedPath: string; resultPath: string; completeAfterMs: number }) {
+    return `exec node --input-type=module -e "import('node:fs').then(fs=>{fs.writeFileSync(process.argv[1],'started');process.on('SIGTERM',()=>{fs.writeFileSync(process.argv[2],'terminated');process.exit(0);});setTimeout(()=>{fs.writeFileSync(process.argv[2],'completed');process.exit(0);},Number(process.argv[3]));});" ${JSON.stringify(options.startedPath)} ${JSON.stringify(options.resultPath)} ${JSON.stringify(String(options.completeAfterMs))}`
+}
+
+function createExtensionContext(cwd: string, options: { signal?: AbortSignal } = {}) {
+    return { cwd, signal: options.signal } as ExtensionContext
 }
 
 describe("pi hooks loader", () => {
@@ -1228,6 +1232,431 @@ describe("pi hooks loader", () => {
             await expect(readFile(outputPath, "utf8")).rejects.toThrow()
             await vi.waitFor(async () => {
                 await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("cancels in-flight hooks when the exposed event abort signal aborts", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const startedPath = join(projectDir, "abort-hook-started.txt")
+        const resultPath = join(projectDir, "abort-hook-result.txt")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_compact: [
+                        {
+                            matcher: "threshold",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createLongRunningHookCommand({
+                                        startedPath,
+                                        resultPath,
+                                        completeAfterMs: 1000,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionBeforeCompact = getSessionBeforeCompactHandler(handlers)
+            const controller = new AbortController()
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(sessionBeforeCompact).toBeTypeOf("function")
+
+            expect(
+                sessionBeforeCompact?.(
+                    {
+                        type: "session_before_compact",
+                        preparation: { tokenEstimate: 42 },
+                        branchEntries: [{ id: "entry-1" }],
+                        reason: "threshold",
+                        willRetry: false,
+                        signal: controller.signal,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
+            })
+
+            controller.abort()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
+            })
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command aborted"))
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("cancels in-flight hooks when the extension context abort signal aborts", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const startedPath = join(projectDir, "ctx-abort-hook-started.txt")
+        const resultPath = join(projectDir, "ctx-abort-hook-result.txt")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createLongRunningHookCommand({
+                                        startedPath,
+                                        resultPath,
+                                        completeAfterMs: 1000,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+            const controller = new AbortController()
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(toolCall).toBeTypeOf("function")
+
+            expect(
+                toolCall?.(
+                    {
+                        type: "tool_call",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        input: { path: "README.md" },
+                    },
+                    createExtensionContext(canonicalProjectDir, { signal: controller.signal }),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
+            })
+
+            controller.abort()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
+            })
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command aborted"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("cancels in-flight hooks and clears session state during replacement shutdown", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const startedPath = join(projectDir, "shutdown-hook-started.txt")
+        const resultPath = join(projectDir, "shutdown-hook-result.txt")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createLongRunningHookCommand({
+                                        startedPath,
+                                        resultPath,
+                                        completeAfterMs: 1000,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+            const sessionShutdown = getSessionShutdownHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(toolCall).toBeTypeOf("function")
+            expect(sessionShutdown).toBeTypeOf("function")
+
+            expect(
+                toolCall?.(
+                    {
+                        type: "tool_call",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        input: { path: "README.md" },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
+            })
+
+            expect(
+                sessionShutdown?.(
+                    {
+                        type: "session_shutdown",
+                        reason: "resume",
+                        targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "resume.json"),
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            expect(getHookRegistry()).toEqual({ files: [] })
+            await vi.waitFor(async () => {
+                await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("cancels timed out hook processes before they can complete", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const startedPath = join(projectDir, "timeout-hook-started.txt")
+        const resultPath = join(projectDir, "timeout-hook-result.txt")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 0.05,
+                                    command: createLongRunningHookCommand({
+                                        startedPath,
+                                        resultPath,
+                                        completeAfterMs: 1000,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(toolCall).toBeTypeOf("function")
+
+            expect(
+                toolCall?.(
+                    {
+                        type: "tool_call",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        input: { path: "README.md" },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
+            })
+            await vi.waitFor(async () => {
+                await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
+            })
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out after 0.05s"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("cancels in-flight hooks during ordinary quit shutdown", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const startedPath = join(projectDir, "quit-shutdown-hook-started.txt")
+        const resultPath = join(projectDir, "quit-shutdown-hook-result.txt")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "read",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createLongRunningHookCommand({
+                                        startedPath,
+                                        resultPath,
+                                        completeAfterMs: 1000,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+            const sessionShutdown = getSessionShutdownHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                toolCall?.(
+                    {
+                        type: "tool_call",
+                        toolCallId: "call-1",
+                        toolName: "read",
+                        input: { path: "README.md" },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
+            })
+
+            expect(
+                sessionShutdown?.(
+                    {
+                        type: "session_shutdown",
+                        reason: "quit",
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            expect(getHookRegistry()).toEqual({ files: [] })
+            await vi.waitFor(async () => {
+                await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
             })
         } finally {
             process.env.HOME = previousHome
