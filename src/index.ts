@@ -48,6 +48,42 @@ type InputEvent = {
     streamingBehavior?: "steer" | "followUp"
 }
 
+type ResourcesDiscoverEvent = {
+    type: "resources_discover"
+    cwd: string
+    reason: "startup" | "reload"
+}
+
+type SessionBeforeSwitchEvent = {
+    type: "session_before_switch"
+    reason: "new" | "resume"
+    targetSessionFile?: string
+}
+
+type SessionBeforeCompactEvent = {
+    type: "session_before_compact"
+    preparation: unknown
+    branchEntries: unknown[]
+    customInstructions?: string
+    reason: "manual" | "threshold" | "overflow"
+    willRetry: boolean
+    signal: AbortSignal
+}
+
+type SessionCompactEvent = {
+    type: "session_compact"
+    compactionEntry: unknown
+    fromExtension: boolean
+    reason: "manual" | "threshold" | "overflow"
+    willRetry: boolean
+}
+
+type SessionShutdownEvent = {
+    type: "session_shutdown"
+    reason: "quit" | "reload" | "new" | "resume" | "fork"
+    targetSessionFile?: string
+}
+
 type ToolExecutionStartEvent = {
     type: "tool_execution_start"
     toolCallId: string
@@ -70,6 +106,22 @@ type ToolExecutionEndEvent = {
     result: unknown
     isError: boolean
 }
+
+type ReasonMatchedEventName =
+    | "resources_discover"
+    | "session_start"
+    | "session_before_switch"
+    | "session_before_compact"
+    | "session_compact"
+    | "session_shutdown"
+
+type ReasonMatchedRuntimeEvent =
+    | ResourcesDiscoverEvent
+    | SessionStartEvent
+    | SessionBeforeSwitchEvent
+    | SessionBeforeCompactEvent
+    | SessionCompactEvent
+    | SessionShutdownEvent
 
 type ToolNamedRuntimeEvent =
     | ToolCallEvent
@@ -155,6 +207,26 @@ export default function setup(pi: ExtensionAPI) {
     pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
         activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
         dispatchSessionStartHooks(event, ctx)
+    })
+
+    pi.on("resources_discover", (event: ResourcesDiscoverEvent, ctx: ExtensionContext) => {
+        dispatchResourcesDiscoverHooks(event, ctx)
+    })
+
+    pi.on("session_before_switch", (event: SessionBeforeSwitchEvent, ctx: ExtensionContext) => {
+        dispatchSessionBeforeSwitchHooks(event, ctx)
+    })
+
+    pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
+        dispatchSessionBeforeCompactHooks(event, ctx)
+    })
+
+    pi.on("session_compact", (event: SessionCompactEvent, ctx: ExtensionContext) => {
+        dispatchSessionCompactHooks(event, ctx)
+    })
+
+    pi.on("session_shutdown", (event: SessionShutdownEvent, ctx: ExtensionContext) => {
+        dispatchSessionShutdownHooks(event, ctx)
     })
 
     pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
@@ -414,14 +486,42 @@ function normalizeHook(value: JsonValue): LoadedHook {
 }
 
 function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionContext) {
+    dispatchReasonMatchedHooks("session_start", event, ctx)
+}
+
+function dispatchResourcesDiscoverHooks(event: ResourcesDiscoverEvent, ctx: ExtensionContext) {
+    dispatchReasonMatchedHooks("resources_discover", event, ctx)
+}
+
+function dispatchSessionBeforeSwitchHooks(event: SessionBeforeSwitchEvent, ctx: ExtensionContext) {
+    dispatchReasonMatchedHooks("session_before_switch", event, ctx)
+}
+
+function dispatchSessionBeforeCompactHooks(event: SessionBeforeCompactEvent, ctx: ExtensionContext) {
+    dispatchReasonMatchedHooks("session_before_compact", event, ctx)
+}
+
+function dispatchSessionCompactHooks(event: SessionCompactEvent, ctx: ExtensionContext) {
+    dispatchReasonMatchedHooks("session_compact", event, ctx)
+}
+
+function dispatchSessionShutdownHooks(event: SessionShutdownEvent, ctx: ExtensionContext) {
+    dispatchReasonMatchedHooks("session_shutdown", event, ctx)
+}
+
+function dispatchReasonMatchedHooks(
+    eventName: ReasonMatchedEventName,
+    event: ReasonMatchedRuntimeEvent,
+    ctx: ExtensionContext,
+) {
     for (const file of activeRegistry.files) {
         for (const registration of file.events) {
-            if (registration.eventName !== "session_start") {
+            if (registration.eventName !== eventName) {
                 continue
             }
 
             for (const matcherGroup of registration.matcherGroups) {
-                if (!matchesSessionStartReason(matcherGroup.normalizedMatcher, event.reason)) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.reason)) {
                     continue
                 }
 
@@ -577,10 +677,6 @@ function dispatchToolNamedHooks(
     }
 }
 
-function matchesSessionStartReason(matcher: LoadedMatcher, reason: SessionStartEvent["reason"]) {
-    return matchesLoadedMatcher(matcher, reason)
-}
-
 function matchesLoadedMatcher(matcher: LoadedMatcher, value: string) {
     if (matcher.kind === "all") {
         return true
@@ -626,10 +722,14 @@ async function runCommandHook(options: {
         stderrChunks.push(chunk)
     })
 
-    child.stdin.end(JSON.stringify(options.payload))
-
     const exitCode = await new Promise<number | null>((resolve, reject) => {
         child.on("error", (error) => {
+            if (timeoutHandle !== undefined) {
+                clearTimeout(timeoutHandle)
+            }
+            reject(error)
+        })
+        child.stdin.on("error", (error) => {
             if (timeoutHandle !== undefined) {
                 clearTimeout(timeoutHandle)
             }
@@ -641,6 +741,8 @@ async function runCommandHook(options: {
             }
             resolve(code)
         })
+
+        child.stdin.end(JSON.stringify(options.payload))
     })
 
     const stdout = Buffer.concat(stdoutChunks).toString("utf8")

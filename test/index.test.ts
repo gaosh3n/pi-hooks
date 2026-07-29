@@ -34,6 +34,42 @@ type InputEvent = {
     streamingBehavior?: "steer" | "followUp"
 }
 
+type ResourcesDiscoverEvent = {
+    type: "resources_discover"
+    cwd: string
+    reason: "startup" | "reload"
+}
+
+type SessionBeforeSwitchEvent = {
+    type: "session_before_switch"
+    reason: "new" | "resume"
+    targetSessionFile?: string
+}
+
+type SessionBeforeCompactEvent = {
+    type: "session_before_compact"
+    preparation: unknown
+    branchEntries: unknown[]
+    customInstructions?: string
+    reason: "manual" | "threshold" | "overflow"
+    willRetry: boolean
+    signal: AbortSignal
+}
+
+type SessionCompactEvent = {
+    type: "session_compact"
+    compactionEntry: unknown
+    fromExtension: boolean
+    reason: "manual" | "threshold" | "overflow"
+    willRetry: boolean
+}
+
+type SessionShutdownEvent = {
+    type: "session_shutdown"
+    reason: "quit" | "reload" | "new" | "resume" | "fork"
+    targetSessionFile?: string
+}
+
 type ToolExecutionStartEvent = {
     type: "tool_execution_start"
     toolCallId: string
@@ -103,6 +139,46 @@ function getInputHandler(
     handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
 ) {
     return handlers.input as ((event: InputEvent, ctx: ExtensionContext) => Promise<void> | undefined) | undefined
+}
+
+function getResourcesDiscoverHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.resources_discover as
+        | ((event: ResourcesDiscoverEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getSessionBeforeSwitchHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.session_before_switch as
+        | ((event: SessionBeforeSwitchEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getSessionBeforeCompactHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.session_before_compact as
+        | ((event: SessionBeforeCompactEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getSessionCompactHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.session_compact as
+        | ((event: SessionCompactEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getSessionShutdownHandler(
+    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
+) {
+    return handlers.session_shutdown as
+        | ((event: SessionShutdownEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
 }
 
 function getToolCallHandler(
@@ -560,6 +636,864 @@ describe("pi hooks loader", () => {
             })
             await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
         } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching resources_discover hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "resources-discover-payload.json")
+        const cwdOutputPath = join(projectDir, "resources-discover-cwd.txt")
+        const skippedOutputPath = join(projectDir, "resources-discover-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    resources_discover: [
+                        {
+                            matcher: "startup",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "reload",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const resourcesDiscover = getResourcesDiscoverHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(resourcesDiscover).toBeTypeOf("function")
+
+            await resourcesDiscover?.(
+                {
+                    type: "resources_discover",
+                    cwd: canonicalProjectDir,
+                    reason: "startup",
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; cwd: string; reason: string }
+                }
+
+                expect(payload).toEqual({
+                    event: "resources_discover",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["startup"] },
+                    payload: {
+                        type: "resources_discover",
+                        cwd: canonicalProjectDir,
+                        reason: "startup",
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching session_before_switch hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "session-before-switch-payload.json")
+        const cwdOutputPath = join(projectDir, "session-before-switch-cwd.txt")
+        const skippedOutputPath = join(projectDir, "session-before-switch-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_switch: [
+                        {
+                            matcher: "resume",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "new",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionBeforeSwitch = getSessionBeforeSwitchHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(sessionBeforeSwitch).toBeTypeOf("function")
+
+            await sessionBeforeSwitch?.(
+                {
+                    type: "session_before_switch",
+                    reason: "resume",
+                    targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "resume.json"),
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; reason: string; targetSessionFile?: string }
+                }
+
+                expect(payload).toEqual({
+                    event: "session_before_switch",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["resume"] },
+                    payload: {
+                        type: "session_before_switch",
+                        reason: "resume",
+                        targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "resume.json"),
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching session_before_compact hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "session-before-compact-payload.json")
+        const cwdOutputPath = join(projectDir, "session-before-compact-cwd.txt")
+        const skippedOutputPath = join(projectDir, "session-before-compact-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_compact: [
+                        {
+                            matcher: "threshold",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "manual",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionBeforeCompact = getSessionBeforeCompactHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(sessionBeforeCompact).toBeTypeOf("function")
+
+            await sessionBeforeCompact?.(
+                {
+                    type: "session_before_compact",
+                    preparation: { tokenEstimate: 42 },
+                    branchEntries: [{ id: "entry-1" }],
+                    customInstructions: "Summarize briefly",
+                    reason: "threshold",
+                    willRetry: false,
+                    signal: new AbortController().signal,
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        preparation: { tokenEstimate: number }
+                        branchEntries: Array<{ id: string }>
+                        customInstructions?: string
+                        reason: string
+                        willRetry: boolean
+                        signal: object
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "session_before_compact",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["threshold"] },
+                    payload: {
+                        type: "session_before_compact",
+                        preparation: { tokenEstimate: 42 },
+                        branchEntries: [{ id: "entry-1" }],
+                        customInstructions: "Summarize briefly",
+                        reason: "threshold",
+                        willRetry: false,
+                        signal: {},
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching session_compact hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "session-compact-payload.json")
+        const cwdOutputPath = join(projectDir, "session-compact-cwd.txt")
+        const skippedOutputPath = join(projectDir, "session-compact-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_compact: [
+                        {
+                            matcher: "overflow",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "manual",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionCompact = getSessionCompactHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(sessionCompact).toBeTypeOf("function")
+
+            await sessionCompact?.(
+                {
+                    type: "session_compact",
+                    compactionEntry: { id: "compact-1" },
+                    fromExtension: false,
+                    reason: "overflow",
+                    willRetry: true,
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        compactionEntry: { id: string }
+                        fromExtension: boolean
+                        reason: string
+                        willRetry: boolean
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "session_compact",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["overflow"] },
+                    payload: {
+                        type: "session_compact",
+                        compactionEntry: { id: "compact-1" },
+                        fromExtension: false,
+                        reason: "overflow",
+                        willRetry: true,
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching session_shutdown hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "session-shutdown-payload.json")
+        const cwdOutputPath = join(projectDir, "session-shutdown-cwd.txt")
+        const skippedOutputPath = join(projectDir, "session-shutdown-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_shutdown: [
+                        {
+                            matcher: "resume",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "quit",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionShutdown = getSessionShutdownHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(sessionShutdown).toBeTypeOf("function")
+
+            await sessionShutdown?.(
+                {
+                    type: "session_shutdown",
+                    reason: "resume",
+                    targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "next.json"),
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; reason: string; targetSessionFile?: string }
+                }
+
+                expect(payload).toEqual({
+                    event: "session_shutdown",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["resume"] },
+                    payload: {
+                        type: "session_shutdown",
+                        reason: "resume",
+                        targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "next.json"),
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not block or cancel session_before_switch handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-session-before-switch.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_switch: [
+                        {
+                            matcher: "resume",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 5,
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionBeforeSwitch = getSessionBeforeSwitchHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: SessionBeforeSwitchEvent = {
+                type: "session_before_switch",
+                reason: "resume",
+                targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "resume.json"),
+            }
+
+            expect(sessionBeforeSwitch?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            expect(event).toEqual({
+                type: "session_before_switch",
+                reason: "resume",
+                targetSessionFile: join(canonicalProjectDir, ".pi", "sessions", "resume.json"),
+            })
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not block or customize session_before_compact handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-session-before-compact.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_compact: [
+                        {
+                            matcher: "manual",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 5,
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionBeforeCompact = getSessionBeforeCompactHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: SessionBeforeCompactEvent = {
+                type: "session_before_compact",
+                preparation: { tokenEstimate: 99 },
+                branchEntries: [{ id: "entry-1" }],
+                customInstructions: "Keep this",
+                reason: "manual",
+                willRetry: false,
+                signal: new AbortController().signal,
+            }
+
+            expect(sessionBeforeCompact?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            expect(event.preparation).toEqual({ tokenEstimate: 99 })
+            expect(event.branchEntries).toEqual([{ id: "entry-1" }])
+            expect(event.customInstructions).toBe("Keep this")
+            expect(event.reason).toBe("manual")
+            expect(event.willRetry).toBe(false)
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports non-zero session_shutdown hook exits without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_shutdown: [
+                        {
+                            matcher: "quit",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.stdout.write('hook-out');process.stderr.write('hook-err');process.exit(9)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionShutdown = getSessionShutdownHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                sessionShutdown?.(
+                    {
+                        type: "session_shutdown",
+                        reason: "quit",
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 9"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-err"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports timed out session_compact hooks without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_compact: [
+                        {
+                            matcher: "manual",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 0.05,
+                                    command: `node --input-type=module -e "setTimeout(()=>process.exit(0),200)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionCompact = getSessionCompactHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                sessionCompact?.(
+                    {
+                        type: "session_compact",
+                        compactionEntry: { id: "compact-1" },
+                        fromExtension: false,
+                        reason: "manual",
+                        willRetry: false,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out after 0.05s"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("node --input-type=module"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports session_compact stdin EPIPE failures without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_compact: [
+                        {
+                            matcher: "manual",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.exit(0)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionCompact = getSessionCompactHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                sessionCompact?.(
+                    {
+                        type: "session_compact",
+                        compactionEntry: { body: "x".repeat(2_000_000) },
+                        fromExtension: false,
+                        reason: "manual",
+                        willRetry: false,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("write EPIPE"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports session_before_switch hook spawn failures without crashing handler execution", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_switch: [
+                        {
+                            matcher: "new",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: `node --input-type=module -e "process.exit(0)"`,
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionBeforeSwitch = getSessionBeforeSwitchHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                sessionBeforeSwitch?.(
+                    {
+                        type: "session_before_switch",
+                        reason: "new",
+                    },
+                    createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
+                ),
+            ).toBeUndefined()
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
+                expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i))
+            })
+        } finally {
+            warn.mockRestore()
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
