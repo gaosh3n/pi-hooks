@@ -84,6 +84,11 @@ type ResourcesDiscoverEvent = {
     reason: "startup" | "reload"
 }
 
+type SessionInfoChangedEvent = {
+    type: "session_info_changed"
+    name: string | undefined
+}
+
 type SessionBeforeSwitchEvent = {
     type: "session_before_switch"
     reason: "new" | "resume"
@@ -108,10 +113,93 @@ type SessionCompactEvent = {
     willRetry: boolean
 }
 
+type SessionBeforeForkEvent = {
+    type: "session_before_fork"
+    entryId: string
+    position: "before" | "at"
+}
+
 type SessionShutdownEvent = {
     type: "session_shutdown"
     reason: "quit" | "reload" | "new" | "resume" | "fork"
     targetSessionFile?: string
+}
+
+type SessionBeforeTreeEvent = {
+    type: "session_before_tree"
+    preparation: unknown
+    signal: AbortSignal
+}
+
+type SessionTreeEvent = {
+    type: "session_tree"
+    newLeafId: string | null
+    oldLeafId: string | null
+    summaryEntry?: unknown
+    fromExtension?: boolean
+}
+
+type ContextEvent = {
+    type: "context"
+    messages: unknown[]
+}
+
+type BeforeProviderRequestEvent = {
+    type: "before_provider_request"
+    payload: unknown
+}
+
+type BeforeProviderHeadersEvent = {
+    type: "before_provider_headers"
+    headers: Record<string, string | null>
+}
+
+type AfterProviderResponseEvent = {
+    type: "after_provider_response"
+    status: number
+    headers: Record<string, string>
+}
+
+type AgentStartEvent = {
+    type: "agent_start"
+}
+
+type AgentEndEvent = {
+    type: "agent_end"
+    messages: unknown[]
+}
+
+type AgentSettledEvent = {
+    type: "agent_settled"
+}
+
+type TurnStartEvent = {
+    type: "turn_start"
+    turnIndex: number
+    timestamp: number
+}
+
+type TurnEndEvent = {
+    type: "turn_end"
+    turnIndex: number
+    message: unknown
+    toolResults: unknown[]
+}
+
+type MessageStartEvent = {
+    type: "message_start"
+    message: unknown
+}
+
+type MessageUpdateEvent = {
+    type: "message_update"
+    message: unknown
+    assistantMessageEvent: unknown
+}
+
+type MessageEndEvent = {
+    type: "message_end"
+    message: unknown
 }
 
 type ToolExecutionStartEvent = {
@@ -152,6 +240,42 @@ type ReasonMatchedRuntimeEvent =
     | SessionBeforeCompactEvent
     | SessionCompactEvent
     | SessionShutdownEvent
+
+type MatchAllOnlyEventName =
+    | "session_info_changed"
+    | "session_before_fork"
+    | "session_before_tree"
+    | "session_tree"
+    | "context"
+    | "before_provider_request"
+    | "before_provider_headers"
+    | "after_provider_response"
+    | "agent_start"
+    | "agent_end"
+    | "agent_settled"
+    | "turn_start"
+    | "turn_end"
+    | "message_start"
+    | "message_update"
+    | "message_end"
+
+type MatchAllOnlyRuntimeEvent =
+    | SessionInfoChangedEvent
+    | SessionBeforeForkEvent
+    | SessionBeforeTreeEvent
+    | SessionTreeEvent
+    | ContextEvent
+    | BeforeProviderRequestEvent
+    | BeforeProviderHeadersEvent
+    | AfterProviderResponseEvent
+    | AgentStartEvent
+    | AgentEndEvent
+    | AgentSettledEvent
+    | TurnStartEvent
+    | TurnEndEvent
+    | MessageStartEvent
+    | MessageUpdateEvent
+    | MessageEndEvent
 
 type ToolNamedRuntimeEvent =
     | ToolCallEvent
@@ -269,8 +393,72 @@ export default function setup(pi: ExtensionAPI) {
         dispatchResourcesDiscoverHooks(event, ctx)
     })
 
+    pi.on("session_info_changed", (event: SessionInfoChangedEvent, ctx: ExtensionContext) => {
+        dispatchSessionInfoChangedHooks(event, ctx)
+    })
+
     pi.on("session_before_switch", (event: SessionBeforeSwitchEvent, ctx: ExtensionContext) => {
         dispatchSessionBeforeSwitchHooks(event, ctx)
+    })
+
+    pi.on("session_before_fork", (event: SessionBeforeForkEvent, ctx: ExtensionContext) => {
+        dispatchSessionBeforeForkHooks(event, ctx)
+    })
+
+    pi.on("session_before_tree", (event: SessionBeforeTreeEvent, ctx: ExtensionContext) => {
+        dispatchSessionBeforeTreeHooks(event, ctx)
+    })
+
+    pi.on("session_tree", (event: SessionTreeEvent, ctx: ExtensionContext) => {
+        dispatchSessionTreeHooks(event, ctx)
+    })
+
+    pi.on("context", (event: ContextEvent, ctx: ExtensionContext) => {
+        dispatchContextHooks(event, ctx)
+    })
+
+    pi.on("before_provider_request", (event: BeforeProviderRequestEvent, ctx: ExtensionContext) => {
+        dispatchBeforeProviderRequestHooks(event, ctx)
+    })
+
+    pi.on("before_provider_headers", (event: BeforeProviderHeadersEvent, ctx: ExtensionContext) => {
+        dispatchBeforeProviderHeadersHooks(event, ctx)
+    })
+
+    pi.on("after_provider_response", (event: AfterProviderResponseEvent, ctx: ExtensionContext) => {
+        dispatchAfterProviderResponseHooks(event, ctx)
+    })
+
+    pi.on("agent_start", (event: AgentStartEvent, ctx: ExtensionContext) => {
+        dispatchAgentStartHooks(event, ctx)
+    })
+
+    pi.on("agent_end", (event: AgentEndEvent, ctx: ExtensionContext) => {
+        dispatchAgentEndHooks(event, ctx)
+    })
+
+    pi.on("agent_settled", (event: AgentSettledEvent, ctx: ExtensionContext) => {
+        dispatchAgentSettledHooks(event, ctx)
+    })
+
+    pi.on("turn_start", (event: TurnStartEvent, ctx: ExtensionContext) => {
+        dispatchTurnStartHooks(event, ctx)
+    })
+
+    pi.on("turn_end", (event: TurnEndEvent, ctx: ExtensionContext) => {
+        dispatchTurnEndHooks(event, ctx)
+    })
+
+    pi.on("message_start", (event: MessageStartEvent, ctx: ExtensionContext) => {
+        dispatchMessageStartHooks(event, ctx)
+    })
+
+    pi.on("message_update", (event: MessageUpdateEvent, ctx: ExtensionContext) => {
+        dispatchMessageUpdateHooks(event, ctx)
+    })
+
+    pi.on("message_end", (event: MessageEndEvent, ctx: ExtensionContext) => {
+        dispatchMessageEndHooks(event, ctx)
     })
 
     pi.on("session_before_compact", (event: SessionBeforeCompactEvent, ctx: ExtensionContext) => {
@@ -483,7 +671,7 @@ function normalizeMatcherGroups(
         try {
             matcherGroups.push({
                 matcher,
-                normalizedMatcher: normalizeMatcher(matcher),
+                normalizedMatcher: normalizeMatcherForEvent(matcher, context),
                 hooks: (matcherGroup.hooks as JsonValue[]).map(normalizeHook),
             })
         } catch (error) {
@@ -494,6 +682,45 @@ function normalizeMatcherGroups(
     }
 
     return matcherGroups
+}
+
+function normalizeMatcherForEvent(
+    matcher: string | undefined,
+    context: { eventName: string; sourcePath: string },
+): LoadedMatcher {
+    if (!isMatchAllOnlyEvent(context.eventName)) {
+        return normalizeMatcher(matcher)
+    }
+
+    if (matcher === undefined) {
+        return { kind: "all" }
+    }
+
+    console.warn(
+        `Ignoring matcher in hooks.json at ${context.sourcePath} for ${context.eventName}: ${matcher} (event is match-all-only)`,
+    )
+    return { kind: "all" }
+}
+
+function isMatchAllOnlyEvent(eventName: string): eventName is MatchAllOnlyEventName {
+    return (
+        eventName === "session_info_changed" ||
+        eventName === "session_before_fork" ||
+        eventName === "session_before_tree" ||
+        eventName === "session_tree" ||
+        eventName === "context" ||
+        eventName === "before_provider_request" ||
+        eventName === "before_provider_headers" ||
+        eventName === "after_provider_response" ||
+        eventName === "agent_start" ||
+        eventName === "agent_end" ||
+        eventName === "agent_settled" ||
+        eventName === "turn_start" ||
+        eventName === "turn_end" ||
+        eventName === "message_start" ||
+        eventName === "message_update" ||
+        eventName === "message_end"
+    )
 }
 
 function normalizeMatcher(matcher: string | undefined): LoadedMatcher {
@@ -669,8 +896,72 @@ function dispatchResourcesDiscoverHooks(event: ResourcesDiscoverEvent, ctx: Exte
     dispatchReasonMatchedHooks("resources_discover", event, ctx)
 }
 
+function dispatchSessionInfoChangedHooks(event: SessionInfoChangedEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("session_info_changed", event, ctx)
+}
+
 function dispatchSessionBeforeSwitchHooks(event: SessionBeforeSwitchEvent, ctx: ExtensionContext) {
     dispatchReasonMatchedHooks("session_before_switch", event, ctx)
+}
+
+function dispatchSessionBeforeForkHooks(event: SessionBeforeForkEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("session_before_fork", event, ctx)
+}
+
+function dispatchSessionBeforeTreeHooks(event: SessionBeforeTreeEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("session_before_tree", event, ctx)
+}
+
+function dispatchSessionTreeHooks(event: SessionTreeEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("session_tree", event, ctx)
+}
+
+function dispatchContextHooks(event: ContextEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("context", event, ctx)
+}
+
+function dispatchBeforeProviderRequestHooks(event: BeforeProviderRequestEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("before_provider_request", event, ctx)
+}
+
+function dispatchBeforeProviderHeadersHooks(event: BeforeProviderHeadersEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("before_provider_headers", event, ctx)
+}
+
+function dispatchAfterProviderResponseHooks(event: AfterProviderResponseEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("after_provider_response", event, ctx)
+}
+
+function dispatchAgentStartHooks(event: AgentStartEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("agent_start", event, ctx)
+}
+
+function dispatchAgentEndHooks(event: AgentEndEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("agent_end", event, ctx)
+}
+
+function dispatchAgentSettledHooks(event: AgentSettledEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("agent_settled", event, ctx)
+}
+
+function dispatchTurnStartHooks(event: TurnStartEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("turn_start", event, ctx)
+}
+
+function dispatchTurnEndHooks(event: TurnEndEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("turn_end", event, ctx)
+}
+
+function dispatchMessageStartHooks(event: MessageStartEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("message_start", event, ctx)
+}
+
+function dispatchMessageUpdateHooks(event: MessageUpdateEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("message_update", event, ctx)
+}
+
+function dispatchMessageEndHooks(event: MessageEndEvent, ctx: ExtensionContext) {
+    dispatchMatchAllHooks("message_end", event, ctx)
 }
 
 function dispatchSessionBeforeCompactHooks(event: SessionBeforeCompactEvent, ctx: ExtensionContext) {
@@ -706,6 +997,40 @@ function dispatchReasonMatchedHooks(
                     continue
                 }
 
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                        abortSignal: getHookAbortSignal(event, ctx),
+                    }).catch((error: unknown) => {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
+function dispatchMatchAllHooks(
+    eventName: MatchAllOnlyEventName,
+    event: MatchAllOnlyRuntimeEvent,
+    ctx: ExtensionContext,
+) {
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== eventName) {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
                 for (const hook of matcherGroup.hooks) {
                     void runCommandHook({
                         hook,

@@ -78,6 +78,11 @@ type ResourcesDiscoverEvent = {
     reason: "startup" | "reload"
 }
 
+type SessionInfoChangedEvent = {
+    type: "session_info_changed"
+    name: string | undefined
+}
+
 type SessionBeforeSwitchEvent = {
     type: "session_before_switch"
     reason: "new" | "resume"
@@ -102,10 +107,93 @@ type SessionCompactEvent = {
     willRetry: boolean
 }
 
+type SessionBeforeForkEvent = {
+    type: "session_before_fork"
+    entryId: string
+    position: "before" | "at"
+}
+
 type SessionShutdownEvent = {
     type: "session_shutdown"
     reason: "quit" | "reload" | "new" | "resume" | "fork"
     targetSessionFile?: string
+}
+
+type SessionBeforeTreeEvent = {
+    type: "session_before_tree"
+    preparation: unknown
+    signal: AbortSignal
+}
+
+type SessionTreeEvent = {
+    type: "session_tree"
+    newLeafId: string | null
+    oldLeafId: string | null
+    summaryEntry?: unknown
+    fromExtension?: boolean
+}
+
+type ContextEvent = {
+    type: "context"
+    messages: unknown[]
+}
+
+type BeforeProviderRequestEvent = {
+    type: "before_provider_request"
+    payload: unknown
+}
+
+type BeforeProviderHeadersEvent = {
+    type: "before_provider_headers"
+    headers: Record<string, string | null>
+}
+
+type AfterProviderResponseEvent = {
+    type: "after_provider_response"
+    status: number
+    headers: Record<string, string>
+}
+
+type AgentStartEvent = {
+    type: "agent_start"
+}
+
+type AgentEndEvent = {
+    type: "agent_end"
+    messages: unknown[]
+}
+
+type AgentSettledEvent = {
+    type: "agent_settled"
+}
+
+type TurnStartEvent = {
+    type: "turn_start"
+    turnIndex: number
+    timestamp: number
+}
+
+type TurnEndEvent = {
+    type: "turn_end"
+    turnIndex: number
+    message: unknown
+    toolResults: unknown[]
+}
+
+type MessageStartEvent = {
+    type: "message_start"
+    message: unknown
+}
+
+type MessageUpdateEvent = {
+    type: "message_update"
+    message: unknown
+    assistantMessageEvent: unknown
+}
+
+type MessageEndEvent = {
+    type: "message_end"
+    message: unknown
 }
 
 type ToolExecutionStartEvent = {
@@ -153,6 +241,13 @@ function createExtensionApiDouble() {
 
 function getSessionStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.session_start as ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>) | undefined
+}
+
+function getRuntimeHandler<TEvent>(
+    handlers: Partial<Record<string, (...args: unknown[]) => unknown>>,
+    eventName: string,
+) {
+    return handlers[eventName] as ((event: TEvent, ctx: ExtensionContext) => Promise<void> | undefined) | undefined
 }
 
 function getBeforeAgentStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
@@ -970,6 +1065,499 @@ describe("pi hooks loader", () => {
                 await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
             })
             await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs match-all-only session and provider hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
+        const cases = [
+            {
+                eventName: "session_info_changed",
+                event: { type: "session_info_changed", name: "renamed-session" } satisfies SessionInfoChangedEvent,
+                payloadPath: join(projectDir, "session-info-changed-payload.json"),
+                cwdPath: join(projectDir, "session-info-changed-cwd.txt"),
+            },
+            {
+                eventName: "session_before_fork",
+                event: {
+                    type: "session_before_fork",
+                    entryId: "entry-42",
+                    position: "before",
+                } satisfies SessionBeforeForkEvent,
+                payloadPath: join(projectDir, "session-before-fork-payload.json"),
+                cwdPath: join(projectDir, "session-before-fork-cwd.txt"),
+            },
+            {
+                eventName: "session_before_tree",
+                event: {
+                    type: "session_before_tree",
+                    preparation: { targetId: "leaf-2", oldLeafId: "leaf-1" },
+                    signal: new AbortController().signal,
+                } satisfies SessionBeforeTreeEvent,
+                payloadPath: join(projectDir, "session-before-tree-payload.json"),
+                cwdPath: join(projectDir, "session-before-tree-cwd.txt"),
+            },
+            {
+                eventName: "session_tree",
+                event: {
+                    type: "session_tree",
+                    newLeafId: "leaf-2",
+                    oldLeafId: "leaf-1",
+                    summaryEntry: { id: "summary-1" },
+                    fromExtension: false,
+                } satisfies SessionTreeEvent,
+                payloadPath: join(projectDir, "session-tree-payload.json"),
+                cwdPath: join(projectDir, "session-tree-cwd.txt"),
+            },
+            {
+                eventName: "context",
+                event: {
+                    type: "context",
+                    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+                } satisfies ContextEvent,
+                payloadPath: join(projectDir, "context-payload.json"),
+                cwdPath: join(projectDir, "context-cwd.txt"),
+            },
+            {
+                eventName: "before_provider_request",
+                event: {
+                    type: "before_provider_request",
+                    payload: { model: "gpt-5", messages: [{ role: "user", content: "hello" }] },
+                } satisfies BeforeProviderRequestEvent,
+                payloadPath: join(projectDir, "before-provider-request-payload.json"),
+                cwdPath: join(projectDir, "before-provider-request-cwd.txt"),
+            },
+            {
+                eventName: "before_provider_headers",
+                event: {
+                    type: "before_provider_headers",
+                    headers: { authorization: "Bearer token", "x-trace-id": null },
+                } satisfies BeforeProviderHeadersEvent,
+                payloadPath: join(projectDir, "before-provider-headers-payload.json"),
+                cwdPath: join(projectDir, "before-provider-headers-cwd.txt"),
+            },
+            {
+                eventName: "after_provider_response",
+                event: {
+                    type: "after_provider_response",
+                    status: 200,
+                    headers: { "content-type": "application/json" },
+                } satisfies AfterProviderResponseEvent,
+                payloadPath: join(projectDir, "after-provider-response-payload.json"),
+                cwdPath: join(projectDir, "after-provider-response-cwd.txt"),
+            },
+        ] as const
+
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: Object.fromEntries(
+                    cases.map(({ eventName, payloadPath, cwdPath }) => [
+                        eventName,
+                        [
+                            {
+                                hooks: [
+                                    { type: "command", command: createNodeHookCommand(payloadPath) },
+                                    { type: "command", command: createNodeCwdCommand(cwdPath) },
+                                ],
+                            },
+                        ],
+                    ]),
+                ),
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            await getSessionStartHandler(handlers)?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            for (const testCase of cases) {
+                const handler = getRuntimeHandler<typeof testCase.event>(handlers, testCase.eventName)
+                expect(handler).toBeTypeOf("function")
+                await handler?.(testCase.event, createExtensionContext(canonicalProjectDir))
+            }
+
+            await vi.waitFor(async () => {
+                for (const testCase of cases) {
+                    const payload = JSON.parse(await readFile(testCase.payloadPath, "utf8")) as {
+                        event: string
+                        sourcePath: string
+                        matcher: unknown
+                        payload: unknown
+                    }
+
+                    expect(payload).toEqual({
+                        event: testCase.eventName,
+                        sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                        matcher: { kind: "all" },
+                        payload: JSON.parse(JSON.stringify(testCase.event)),
+                    })
+                    await expect(readFile(testCase.cwdPath, "utf8")).resolves.toBe(canonicalProjectDir)
+                }
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs match-all-only agent and message hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
+        const assistantMessage = {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+        }
+        const cases = [
+            {
+                eventName: "agent_start",
+                event: { type: "agent_start" } satisfies AgentStartEvent,
+                payloadPath: join(projectDir, "agent-start-payload.json"),
+                cwdPath: join(projectDir, "agent-start-cwd.txt"),
+            },
+            {
+                eventName: "agent_end",
+                event: { type: "agent_end", messages: [assistantMessage] } satisfies AgentEndEvent,
+                payloadPath: join(projectDir, "agent-end-payload.json"),
+                cwdPath: join(projectDir, "agent-end-cwd.txt"),
+            },
+            {
+                eventName: "agent_settled",
+                event: { type: "agent_settled" } satisfies AgentSettledEvent,
+                payloadPath: join(projectDir, "agent-settled-payload.json"),
+                cwdPath: join(projectDir, "agent-settled-cwd.txt"),
+            },
+            {
+                eventName: "turn_start",
+                event: { type: "turn_start", turnIndex: 2, timestamp: 1234567890 } satisfies TurnStartEvent,
+                payloadPath: join(projectDir, "turn-start-payload.json"),
+                cwdPath: join(projectDir, "turn-start-cwd.txt"),
+            },
+            {
+                eventName: "turn_end",
+                event: {
+                    type: "turn_end",
+                    turnIndex: 2,
+                    message: assistantMessage,
+                    toolResults: [{ toolName: "read", content: [{ type: "text", text: "ok" }] }],
+                } satisfies TurnEndEvent,
+                payloadPath: join(projectDir, "turn-end-payload.json"),
+                cwdPath: join(projectDir, "turn-end-cwd.txt"),
+            },
+            {
+                eventName: "message_start",
+                event: { type: "message_start", message: assistantMessage } satisfies MessageStartEvent,
+                payloadPath: join(projectDir, "message-start-payload.json"),
+                cwdPath: join(projectDir, "message-start-cwd.txt"),
+            },
+            {
+                eventName: "message_update",
+                event: {
+                    type: "message_update",
+                    message: assistantMessage,
+                    assistantMessageEvent: { type: "text_delta", text: "more" },
+                } satisfies MessageUpdateEvent,
+                payloadPath: join(projectDir, "message-update-payload.json"),
+                cwdPath: join(projectDir, "message-update-cwd.txt"),
+            },
+            {
+                eventName: "message_end",
+                event: { type: "message_end", message: assistantMessage } satisfies MessageEndEvent,
+                payloadPath: join(projectDir, "message-end-payload.json"),
+                cwdPath: join(projectDir, "message-end-cwd.txt"),
+            },
+        ] as const
+
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: Object.fromEntries(
+                    cases.map(({ eventName, payloadPath, cwdPath }) => [
+                        eventName,
+                        [
+                            {
+                                hooks: [
+                                    { type: "command", command: createNodeHookCommand(payloadPath) },
+                                    { type: "command", command: createNodeCwdCommand(cwdPath) },
+                                ],
+                            },
+                        ],
+                    ]),
+                ),
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            await getSessionStartHandler(handlers)?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            for (const testCase of cases) {
+                const handler = getRuntimeHandler<typeof testCase.event>(handlers, testCase.eventName)
+                expect(handler).toBeTypeOf("function")
+                await handler?.(testCase.event, createExtensionContext(canonicalProjectDir))
+            }
+
+            await vi.waitFor(async () => {
+                for (const testCase of cases) {
+                    const payload = JSON.parse(await readFile(testCase.payloadPath, "utf8")) as {
+                        event: string
+                        sourcePath: string
+                        matcher: unknown
+                        payload: unknown
+                    }
+
+                    expect(payload).toEqual({
+                        event: testCase.eventName,
+                        sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                        matcher: { kind: "all" },
+                        payload: JSON.parse(JSON.stringify(testCase.event)),
+                    })
+                    await expect(readFile(testCase.cwdPath, "utf8")).resolves.toBe(canonicalProjectDir)
+                }
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("warns and ignores configured matchers for match-all-only events while still running hooks", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "session-info-changed-ignored-matcher.json")
+        const invalidRegexOutputPath = join(projectDir, "session-info-changed-invalid-regex.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_info_changed: [
+                        {
+                            matcher: "named-session-only",
+                            hooks: [{ type: "command", command: createNodeHookCommand(outputPath) }],
+                        },
+                        {
+                            matcher: "[",
+                            hooks: [{ type: "command", command: createNodeHookCommand(invalidRegexOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            await getSessionStartHandler(handlers)?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring matcher in hooks.json"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("session_info_changed"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("named-session-only"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("["))
+            expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("Invalid matcher"))
+
+            await getRuntimeHandler<SessionInfoChangedEvent>(handlers, "session_info_changed")?.(
+                { type: "session_info_changed", name: "different-name" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; name: string | undefined }
+                }
+                const invalidRegexPayload = JSON.parse(await readFile(invalidRegexOutputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; name: string | undefined }
+                }
+
+                expect(payload).toEqual({
+                    event: "session_info_changed",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "all" },
+                    payload: { type: "session_info_changed", name: "different-name" },
+                })
+                expect(invalidRegexPayload).toEqual({
+                    event: "session_info_changed",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "all" },
+                    payload: { type: "session_info_changed", name: "different-name" },
+                })
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("does not block or mutate match-all-only observe-only handling", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "slow-session-before-fork.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_before_fork: [
+                        {
+                            hooks: [
+                                {
+                                    type: "command",
+                                    timeout: 5,
+                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                },
+                            ],
+                        },
+                    ],
+                    context: [{ hooks: [{ type: "command", command: "echo context >/dev/null" }] }],
+                    before_provider_request: [{ hooks: [{ type: "command", command: "echo request >/dev/null" }] }],
+                    before_provider_headers: [{ hooks: [{ type: "command", command: "echo headers >/dev/null" }] }],
+                    message_end: [{ hooks: [{ type: "command", command: "echo message >/dev/null" }] }],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            await getSessionStartHandler(handlers)?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const sessionBeforeForkEvent: SessionBeforeForkEvent = {
+                type: "session_before_fork",
+                entryId: "entry-9",
+                position: "at",
+            }
+            const contextEvent: ContextEvent = {
+                type: "context",
+                messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+            }
+            const beforeProviderRequestEvent: BeforeProviderRequestEvent = {
+                type: "before_provider_request",
+                payload: { model: "gpt-5" },
+            }
+            const beforeProviderHeadersEvent: BeforeProviderHeadersEvent = {
+                type: "before_provider_headers",
+                headers: { authorization: "Bearer token" },
+            }
+            const messageEndEvent: MessageEndEvent = {
+                type: "message_end",
+                message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+            }
+
+            expect(
+                getRuntimeHandler<SessionBeforeForkEvent>(handlers, "session_before_fork")?.(
+                    sessionBeforeForkEvent,
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            expect(
+                getRuntimeHandler<ContextEvent>(handlers, "context")?.(
+                    contextEvent,
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            expect(
+                getRuntimeHandler<BeforeProviderRequestEvent>(handlers, "before_provider_request")?.(
+                    beforeProviderRequestEvent,
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            expect(
+                getRuntimeHandler<BeforeProviderHeadersEvent>(handlers, "before_provider_headers")?.(
+                    beforeProviderHeadersEvent,
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            expect(
+                getRuntimeHandler<MessageEndEvent>(handlers, "message_end")?.(
+                    messageEndEvent,
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            expect(sessionBeforeForkEvent).toEqual({ type: "session_before_fork", entryId: "entry-9", position: "at" })
+            expect(contextEvent).toEqual({
+                type: "context",
+                messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+            })
+            expect(beforeProviderRequestEvent).toEqual({ type: "before_provider_request", payload: { model: "gpt-5" } })
+            expect(beforeProviderHeadersEvent).toEqual({
+                type: "before_provider_headers",
+                headers: { authorization: "Bearer token" },
+            })
+            expect(messageEndEvent).toEqual({
+                type: "message_end",
+                message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+            })
+            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
+            await vi.waitFor(async () => {
+                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
