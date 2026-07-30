@@ -48,6 +48,36 @@ type InputEvent = {
     streamingBehavior?: "steer" | "followUp"
 }
 
+type ProjectTrustEvent = {
+    type: "project_trust"
+    cwd: string
+}
+
+type ProjectTrustContext = {
+    cwd: string
+    hasUI: boolean
+    mode?: unknown
+    ui?: unknown
+}
+
+type ProjectTrustEventResult = {
+    trusted: "yes" | "no" | "undecided"
+    remember?: boolean
+}
+
+type ModelSelectEvent = {
+    type: "model_select"
+    source: "set" | "cycle" | "restore"
+    model: unknown
+    previousModel: unknown
+}
+
+type ThinkingLevelSelectEvent = {
+    type: "thinking_level_select"
+    level: string
+    previousLevel: string
+}
+
 type ResourcesDiscoverEvent = {
     type: "resources_discover"
     cwd: string
@@ -216,6 +246,23 @@ export default function setup(pi: ExtensionAPI) {
     pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
         activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
         dispatchSessionStartHooks(event, ctx)
+    })
+
+    pi.on(
+        "project_trust",
+        async (event: ProjectTrustEvent, ctx: ProjectTrustContext): Promise<ProjectTrustEventResult> => {
+            const registry = await loadUserHooksRegistry()
+            dispatchProjectTrustHooks(event, ctx, registry)
+            return { trusted: "undecided" }
+        },
+    )
+
+    pi.on("model_select", (event: ModelSelectEvent, ctx: ExtensionContext) => {
+        dispatchModelSelectHooks(event, ctx)
+    })
+
+    pi.on("thinking_level_select", (event: ThinkingLevelSelectEvent, ctx: ExtensionContext) => {
+        dispatchThinkingLevelSelectHooks(event, ctx)
     })
 
     pi.on("resources_discover", (event: ResourcesDiscoverEvent, ctx: ExtensionContext) => {
@@ -514,6 +561,107 @@ function cancelActiveHookExecutions(reason: HookCancellationReason) {
         execution.clearAbortListener?.()
         execution.clearAbortListener = undefined
         execution.child.kill()
+    }
+}
+
+function dispatchProjectTrustHooks(event: ProjectTrustEvent, ctx: ProjectTrustContext, registry: HookRegistry) {
+    for (const file of registry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "project_trust") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.cwd)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                    }).catch((error: unknown) => {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
+function dispatchModelSelectHooks(event: ModelSelectEvent, ctx: ExtensionContext) {
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "model_select") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.source)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                        abortSignal: getHookAbortSignal(event, ctx),
+                    }).catch((error: unknown) => {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
+function dispatchThinkingLevelSelectHooks(event: ThinkingLevelSelectEvent, ctx: ExtensionContext) {
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "thinking_level_select") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.level)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    void runCommandHook({
+                        hook,
+                        cwd: ctx.cwd,
+                        payload: {
+                            event: registration.eventName,
+                            sourcePath: file.sourcePath,
+                            matcher: matcherGroup.normalizedMatcher,
+                            payload: serializeJsonObject(event),
+                        },
+                        abortSignal: getHookAbortSignal(event, ctx),
+                    }).catch((error: unknown) => {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                    })
+                }
+            }
+        }
     }
 }
 

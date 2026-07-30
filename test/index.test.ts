@@ -34,6 +34,44 @@ type InputEvent = {
     streamingBehavior?: "steer" | "followUp"
 }
 
+type ProjectTrustEvent = {
+    type: "project_trust"
+    cwd: string
+}
+
+type ProjectTrustContext = {
+    cwd: string
+    hasUI: boolean
+    mode?: unknown
+    ui?: unknown
+}
+
+type ProjectTrustEventResult = {
+    trusted: "yes" | "no" | "undecided"
+    remember?: boolean
+}
+
+type ModelSelectEvent = {
+    type: "model_select"
+    source: "set" | "cycle" | "restore"
+    model: {
+        id: string
+        provider?: string
+    }
+    previousModel:
+        | {
+              id: string
+              provider?: string
+          }
+        | undefined
+}
+
+type ThinkingLevelSelectEvent = {
+    type: "thinking_level_select"
+    level: string
+    previousLevel: string
+}
+
 type ResourcesDiscoverEvent = {
     type: "resources_discover"
     cwd: string
@@ -103,9 +141,9 @@ async function makeTempHome() {
 }
 
 function createExtensionApiDouble() {
-    const handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>> = {}
+    const handlers: Partial<Record<string, (...args: unknown[]) => unknown>> = {}
     const pi = {
-        on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+        on(event: string, handler: (...args: unknown[]) => unknown) {
             handlers[event] = handler
         },
     } as ExtensionAPI
@@ -113,107 +151,97 @@ function createExtensionApiDouble() {
     return { pi, handlers }
 }
 
-function getSessionStartHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getSessionStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.session_start as ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>) | undefined
 }
 
-function getBeforeAgentStartHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getBeforeAgentStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.before_agent_start as
         | ((event: BeforeAgentStartEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getUserBashHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getUserBashHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.user_bash as
         | ((event: UserBashEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getInputHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getInputHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.input as ((event: InputEvent, ctx: ExtensionContext) => Promise<void> | undefined) | undefined
 }
 
-function getResourcesDiscoverHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getProjectTrustHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+    return handlers.project_trust as
+        | ((event: ProjectTrustEvent, ctx: ProjectTrustContext) => Promise<ProjectTrustEventResult>)
+        | undefined
+}
+
+function getResourcesDiscoverHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.resources_discover as
         | ((event: ResourcesDiscoverEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionBeforeSwitchHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getSessionBeforeSwitchHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.session_before_switch as
         | ((event: SessionBeforeSwitchEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionBeforeCompactHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getSessionBeforeCompactHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.session_before_compact as
         | ((event: SessionBeforeCompactEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionCompactHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getSessionCompactHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.session_compact as
         | ((event: SessionCompactEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionShutdownHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getSessionShutdownHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.session_shutdown as
         | ((event: SessionShutdownEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolCallHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getModelSelectHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+    return handlers.model_select as
+        | ((event: ModelSelectEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getThinkingLevelSelectHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+    return handlers.thinking_level_select as
+        | ((event: ThinkingLevelSelectEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | undefined
+}
+
+function getToolCallHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.tool_call as ((event: ToolCallEvent, ctx: ExtensionContext) => Promise<void>) | undefined
 }
 
-function getToolResultHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getToolResultHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.tool_result as
         | ((event: ToolResultEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolExecutionStartHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getToolExecutionStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.tool_execution_start as
         | ((event: ToolExecutionStartEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolExecutionUpdateHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getToolExecutionUpdateHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.tool_execution_update as
         | ((event: ToolExecutionUpdateEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolExecutionEndHandler(
-    handlers: Partial<Record<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>>,
-) {
+function getToolExecutionEndHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
     return handlers.tool_execution_end as
         | ((event: ToolExecutionEndEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
@@ -233,6 +261,10 @@ function createLongRunningHookCommand(options: { startedPath: string; resultPath
 
 function createExtensionContext(cwd: string, options: { signal?: AbortSignal } = {}) {
     return { cwd, signal: options.signal } as ExtensionContext
+}
+
+function createProjectTrustContext(cwd: string, options: { hasUI?: boolean } = {}) {
+    return { cwd, hasUI: options.hasUI ?? false, mode: "test", ui: {} } as ProjectTrustContext
 }
 
 describe("pi hooks loader", () => {
@@ -637,6 +669,305 @@ describe("pi hooks loader", () => {
                     matcher: { kind: "exact", values: ["startup"] },
                     payload: { type: "session_start", reason: "startup" },
                 })
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching project_trust hooks from the user registry and defers the trust decision", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "project-trust-payload.json")
+        const cwdOutputPath = join(projectDir, "project-trust-cwd.txt")
+        const skippedOutputPath = join(projectDir, "project-trust-skipped.json")
+        const projectLocalOutputPath = join(projectDir, "project-trust-project-local.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    project_trust: [
+                        {
+                            matcher: canonicalProjectDir,
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: join(canonicalProjectDir, "other"),
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    project_trust: [
+                        {
+                            matcher: canonicalProjectDir,
+                            hooks: [{ type: "command", command: createNodeHookCommand(projectLocalOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const registry = await loadUserHooksRegistry({ homeDir: canonicalHomeDir })
+            expect(registry.files).toHaveLength(1)
+            expect(registry.files[0]?.events[0]?.eventName).toBe("project_trust")
+            expect(registry.files[0]?.events[0]?.matcherGroups[0]?.normalizedMatcher).toEqual({
+                kind: "exact",
+                values: [canonicalProjectDir],
+            })
+
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const projectTrust = getProjectTrustHandler(handlers)
+
+            expect(projectTrust).toBeTypeOf("function")
+
+            await expect(
+                projectTrust?.(
+                    {
+                        type: "project_trust",
+                        cwd: canonicalProjectDir,
+                    },
+                    createProjectTrustContext(canonicalHomeDir),
+                ),
+            ).resolves.toEqual({ trusted: "undecided" })
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; cwd: string }
+                }
+
+                expect(payload).toEqual({
+                    event: "project_trust",
+                    sourcePath: join(canonicalHomeDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: [canonicalProjectDir] },
+                    payload: {
+                        type: "project_trust",
+                        cwd: canonicalProjectDir,
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalHomeDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+            await expect(readFile(projectLocalOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching model_select hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "model-select-payload.json")
+        const cwdOutputPath = join(projectDir, "model-select-cwd.txt")
+        const skippedOutputPath = join(projectDir, "model-select-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    model_select: [
+                        {
+                            matcher: "cycle",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "restore",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const modelSelect = getModelSelectHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(modelSelect).toBeTypeOf("function")
+
+            await modelSelect?.(
+                {
+                    type: "model_select",
+                    source: "cycle",
+                    model: {
+                        id: "gpt-5",
+                        provider: "openai",
+                    },
+                    previousModel: {
+                        id: "gpt-4.1",
+                        provider: "openai",
+                    },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        source: string
+                        model: { id: string; provider?: string }
+                        previousModel: { id: string; provider?: string } | undefined
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "model_select",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["cycle"] },
+                    payload: {
+                        type: "model_select",
+                        source: "cycle",
+                        model: {
+                            id: "gpt-5",
+                            provider: "openai",
+                        },
+                        previousModel: {
+                            id: "gpt-4.1",
+                            provider: "openai",
+                        },
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
+            })
+            await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("runs matching thinking_level_select hooks with canonical payload in the active session cwd", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "thinking-level-select-payload.json")
+        const cwdOutputPath = join(projectDir, "thinking-level-select-cwd.txt")
+        const skippedOutputPath = join(projectDir, "thinking-level-select-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    thinking_level_select: [
+                        {
+                            matcher: "high",
+                            hooks: [
+                                { type: "command", command: createNodeHookCommand(outputPath) },
+                                { type: "command", command: createNodeCwdCommand(cwdOutputPath) },
+                            ],
+                        },
+                        {
+                            matcher: "minimal",
+                            hooks: [{ type: "command", command: createNodeHookCommand(skippedOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const thinkingLevelSelect = getThinkingLevelSelectHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(thinkingLevelSelect).toBeTypeOf("function")
+
+            await thinkingLevelSelect?.(
+                {
+                    type: "thinking_level_select",
+                    level: "high",
+                    previousLevel: "minimal",
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: {
+                        type: string
+                        level: string
+                        previousLevel: string
+                    }
+                }
+
+                expect(payload).toEqual({
+                    event: "thinking_level_select",
+                    sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: ["high"] },
+                    payload: {
+                        type: "thinking_level_select",
+                        level: "high",
+                        previousLevel: "minimal",
+                    },
+                })
+                await expect(readFile(cwdOutputPath, "utf8")).resolves.toBe(canonicalProjectDir)
             })
             await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
         } finally {
