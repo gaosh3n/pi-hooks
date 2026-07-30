@@ -28,7 +28,7 @@ What may still remain outside schema validation is **loader/runtime validation**
 - compile `matcher` strings and report invalid regexes cleanly
 - normalize/default `timeout`
 - optionally reject matcher usage on events where Pi provides nothing meaningful to match against
-- validate command-hook stdin/stdout protocol once runtime behavior is implemented
+- validate hook input/output contract once runtime behavior is implemented
 
 The conclusion is:
 

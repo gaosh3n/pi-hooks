@@ -289,3 +289,138 @@ Concrete call sites:
 - `run_session_end_hooks`
 - `run_pre_compact_hooks`
 - `run_post_compact_hooks`
+
+## Codex event selection and hook input/output
+
+Additional sources inspected for this supplement:
+
+- `<root-directory>/codex-rs/hooks/src/engine/dispatcher.rs`
+- `<root-directory>/codex-rs/hooks/src/engine/output_parser.rs`
+- `<root-directory>/codex-rs/hooks/src/engine/command_runner_tests.rs`
+- `<root-directory>/codex-rs/hooks/src/schema.rs`
+- `<root-directory>/codex-rs/core/src/hook_runtime.rs`
+
+### Runtime selection stays separate from discovery
+
+After discovery builds the in-memory handler list, Codex does a second explicit selection step per fired event.
+
+`select_handlers()` / `select_handlers_for_matcher_inputs()` in `dispatcher.rs`:
+
+- filter first by event name
+- then filter by matcher only for matcher-capable events
+- force match-all behavior for `UserPromptSubmit` and `Stop`
+- accept multiple matcher inputs for a single fired event when Codex has compatibility aliases
+- still run each configured handler at most once even if several matcher inputs match
+
+Key source excerpt:
+
+```rust
+handlers
+    .iter()
+    .filter(|handler| handler.event_name == event_name)
+    .filter(|handler| match event_name {
+        HookEventName::PreToolUse
+        | HookEventName::PermissionRequest
+        | HookEventName::PostToolUse
+        | HookEventName::SessionStart
+        | HookEventName::SessionEnd
+        | HookEventName::SubagentStart
+        | HookEventName::SubagentStop
+        | HookEventName::PreCompact
+        | HookEventName::PostCompact => {
+            if matcher_inputs.is_empty() {
+                matches_matcher(handler.matcher.as_deref(), /*input*/ None)
+            } else {
+                matcher_inputs
+                    .iter()
+                    .any(|input| matches_matcher(handler.matcher.as_deref(), Some(input)))
+            }
+        }
+        HookEventName::UserPromptSubmit | HookEventName::Stop => true,
+    })
+    .cloned()
+    .collect()
+```
+
+Important implication: Codex keeps the registry normalized once, then computes event-specific selection from that registry without re-reading config files.
+
+### Command stdin is event-specific structured JSON
+
+Codex does not use one generic `{ event, payload }` wire shape for command-hook stdin. Instead, it defines per-event input structs and generated JSON Schemas.
+
+Examples from `schema.rs`:
+
+- `PreToolUseCommandInput` includes `session_id`, `turn_id`, optional subagent metadata, `transcript_path`, `cwd`, `hook_event_name`, `model`, `permission_mode`, `tool_name`, `tool_input`, and `tool_use_id`
+- `SessionStartCommandInput` includes `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `model`, `permission_mode`, and `source`
+- `UserPromptSubmitCommandInput` includes `prompt` rather than a generic payload blob
+
+So Codex's protocol is explicitly event-shaped, not merely event-tagged.
+
+### Command stdout is also event-specific and is the control channel
+
+Codex treats stdout as machine-readable JSON and parses it with event-specific output parsers.
+
+Key points from `output_parser.rs` and `schema.rs`:
+
+- stdout is parsed into event-specific output wire structs such as `SessionStartCommandOutputWire`, `PreToolUseCommandOutputWire`, and `UserPromptSubmitCommandOutputWire`
+- output schemas use `deny_unknown_fields`, so the structured contract is intentionally narrow
+- there is a shared universal output section with fields like:
+    - `continue`
+    - `stopReason`
+    - `suppressOutput`
+    - `systemMessage`
+- event-specific output sections add capabilities such as:
+    - `additional_context`
+    - block decisions + reasons
+    - permission decisions
+    - updated tool input
+
+This means Codex has a deliberate bidirectional protocol: stdin carries structured event data in, stdout carries structured control data back out.
+
+### Event powers are asymmetric, not one global hook capability set
+
+Codex does not grant the same output powers to every event.
+
+Examples:
+
+- `SessionStart` can add context
+- `UserPromptSubmit` can block and add context
+- `PreToolUse` can block, influence permission behavior, add context, and sometimes update tool input
+- `Stop` can block
+- stateless observation-style events have much smaller output shapes
+
+Important implication: Codex's output protocol is event-specific policy, not a uniform "all hooks may mutate the world" rule.
+
+### Execution is concurrent, but result order is normalized
+
+`execute_handlers()` launches selected handlers concurrently with `FuturesUnordered`, but then sorts completed results back into configured order before returning them.
+
+So Codex splits:
+
+- wall-clock completion order
+- configured declaration order
+
+This is a useful design point for any future hook protocol that wants concurrency without nondeterministic aggregate behavior.
+
+### Runtime interpretation is explicit in host call sites
+
+Codex's host runtime does not just collect parsed hook outputs; it applies them at specific seams.
+
+Examples from `hook_runtime.rs`:
+
+- `run_pending_session_start_hooks()` records additional context returned by start hooks
+- `run_pre_tool_use_hooks()` can block a tool call or continue with updated input
+- stop-turn hooks resolve different runtime outcomes from their parsed outputs
+
+So the structured stdout protocol only matters because the host has explicit per-event code that consumes it.
+
+### Output parsing is strict, but unsupported semantics are still interpreted per event
+
+Additional details from `schema.rs` and `output_parser.rs`:
+
+- output wire structs use `deny_unknown_fields`, so unknown JSON fields are rejected at parse time
+- Codex still performs a second semantic validation pass after JSON parsing
+- that semantic pass rejects event-forbidden fields such as unsupported universal controls or malformed block decisions on specific events
+- invalid output is contained at the hook boundary rather than silently reinterpreted into some other effect
+
+This is a useful Pi Hooks reference point: syntax validation and event-policy validation are separate concerns, even when both happen on stdout.
