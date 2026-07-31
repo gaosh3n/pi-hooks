@@ -350,6 +350,10 @@ function createNodeCwdCommand(outputPath: string) {
     return `node --input-type=module -e "import('node:fs').then(fs=>fs.writeFileSync(process.argv[1],process.cwd()));" ${JSON.stringify(outputPath)}`
 }
 
+function createStdoutHookCommand(stdout: string) {
+    return `node --input-type=module -e "process.stdout.write(process.argv[1]);" ${JSON.stringify(stdout)}`
+}
+
 function createLongRunningHookCommand(options: { startedPath: string; resultPath: string; completeAfterMs: number }) {
     return `exec node --input-type=module -e "import('node:fs').then(fs=>{fs.writeFileSync(process.argv[1],'started');process.on('SIGTERM',()=>{fs.writeFileSync(process.argv[2],'terminated');process.exit(0);});setTimeout(()=>{fs.writeFileSync(process.argv[2],'completed');process.exit(0);},Number(process.argv[3]));});" ${JSON.stringify(options.startedPath)} ${JSON.stringify(options.resultPath)} ${JSON.stringify(String(options.completeAfterMs))}`
 }
@@ -759,9 +763,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "session_start",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["startup"] },
+                    cwd: canonicalProjectDir,
                     payload: { type: "session_start", reason: "startup" },
                 })
             })
@@ -858,9 +864,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "project_trust",
                     sourcePath: join(canonicalHomeDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: [canonicalProjectDir] },
+                    cwd: canonicalHomeDir,
                     payload: {
                         type: "project_trust",
                         cwd: canonicalProjectDir,
@@ -956,9 +964,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "model_select",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["cycle"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "model_select",
                         source: "cycle",
@@ -1053,9 +1063,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "thinking_level_select",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["high"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "thinking_level_select",
                         level: "high",
@@ -1206,9 +1218,11 @@ describe("pi hooks loader", () => {
                     }
 
                     expect(payload).toEqual({
+                        version: 1,
                         event: testCase.eventName,
                         sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                         matcher: { kind: "all" },
+                        cwd: canonicalProjectDir,
                         payload: JSON.parse(JSON.stringify(testCase.event)),
                     })
                     await expect(readFile(testCase.cwdPath, "utf8")).resolves.toBe(canonicalProjectDir)
@@ -1341,9 +1355,11 @@ describe("pi hooks loader", () => {
                     }
 
                     expect(payload).toEqual({
+                        version: 1,
                         event: testCase.eventName,
                         sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                         matcher: { kind: "all" },
+                        cwd: canonicalProjectDir,
                         payload: JSON.parse(JSON.stringify(testCase.event)),
                     })
                     await expect(readFile(testCase.cwdPath, "utf8")).resolves.toBe(canonicalProjectDir)
@@ -1423,15 +1439,19 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "session_info_changed",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "all" },
+                    cwd: canonicalProjectDir,
                     payload: { type: "session_info_changed", name: "different-name" },
                 })
                 expect(invalidRegexPayload).toEqual({
+                    version: 1,
                     event: "session_info_changed",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "all" },
+                    cwd: canonicalProjectDir,
                     payload: { type: "session_info_changed", name: "different-name" },
                 })
             })
@@ -1632,9 +1652,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "resources_discover",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["startup"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "resources_discover",
                         cwd: canonicalProjectDir,
@@ -1718,9 +1740,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "session_before_switch",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["resume"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "session_before_switch",
                         reason: "resume",
@@ -1816,9 +1840,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "session_before_compact",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["threshold"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "session_before_compact",
                         preparation: { tokenEstimate: 42 },
@@ -1914,9 +1940,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "session_compact",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["overflow"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "session_compact",
                         compactionEntry: { id: "compact-1" },
@@ -2002,9 +2030,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "session_shutdown",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["resume"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "session_shutdown",
                         reason: "resume",
@@ -2957,6 +2987,92 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("warns and ignores malformed, unknown, and event-unsupported stdout for observe-only session_info_changed hooks", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_info_changed: [
+                        {
+                            hooks: [
+                                { type: "command", command: createStdoutHookCommand("{not valid json") },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "session_info_changed",
+                                            output: {},
+                                            extra: true,
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "session_info_changed",
+                                            output: { systemPrompt: "Override" },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const sessionInfoChanged = getRuntimeHandler<SessionInfoChangedEvent>(handlers, "session_info_changed")
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await sessionInfoChanged?.(
+                { type: "session_info_changed", name: "renamed-session" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for session_info_changed"),
+                )
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property extra"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property systemPrompt"))
+                expect(warn).not.toHaveBeenCalledWith(
+                    expect.stringContaining(
+                        "Ignoring hook stdout for session_info_changed: semantic output is not supported yet",
+                    ),
+                )
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("runs matching before_agent_start hooks with canonical payload in the active session cwd", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
@@ -3031,9 +3147,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "before_agent_start",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["hello world"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "before_agent_start",
                         prompt: "hello world",
@@ -3124,9 +3242,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "user_bash",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["npm test"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "user_bash",
                         command: "npm test",
@@ -3550,9 +3670,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "input",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["hello world"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "input",
                         text: "hello world",
@@ -3900,9 +4022,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "tool_call",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["read"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "tool_call",
                         toolCallId: "call-1",
@@ -3998,9 +4122,11 @@ describe("pi hooks loader", () => {
                 }
 
                 expect(payload).toEqual({
+                    version: 1,
                     event: "tool_result",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["read"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "tool_result",
                         toolCallId: "call-1",
@@ -4327,9 +4453,11 @@ describe("pi hooks loader", () => {
 
             await vi.waitFor(async () => {
                 expect(JSON.parse(await readFile(startOutputPath, "utf8"))).toEqual({
+                    version: 1,
                     event: "tool_execution_start",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["read"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "tool_execution_start",
                         toolCallId: "call-1",
@@ -4339,9 +4467,11 @@ describe("pi hooks loader", () => {
                 })
 
                 expect(JSON.parse(await readFile(updateOutputPath, "utf8"))).toEqual({
+                    version: 1,
                     event: "tool_execution_update",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["read"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "tool_execution_update",
                         toolCallId: "call-1",
@@ -4352,9 +4482,11 @@ describe("pi hooks loader", () => {
                 })
 
                 expect(JSON.parse(await readFile(endOutputPath, "utf8"))).toEqual({
+                    version: 1,
                     event: "tool_execution_end",
                     sourcePath: join(canonicalProjectDir, ".pi", "hooks.json"),
                     matcher: { kind: "exact", values: ["read"] },
+                    cwd: canonicalProjectDir,
                     payload: {
                         type: "tool_execution_end",
                         toolCallId: "call-1",

@@ -316,19 +316,61 @@ export interface HookRegistry {
 
 type HookCancellationReason = "abort" | "shutdown" | "timeout"
 
+type HookStdinEnvelope = {
+    version: 1
+    event: string
+    sourcePath: string
+    matcher: LoadedMatcher
+    cwd: string
+    payload: JsonObject
+}
+
+type HookStdoutEnvelope = {
+    version: 1
+    event: string
+    output: JsonObject
+}
+
+type HookStdoutParseResult =
+    | { kind: "empty" }
+    | { kind: "invalid"; warning: string }
+    | { kind: "valid"; envelope: HookStdoutEnvelope }
+
 type ActiveHookExecution = {
     child: ChildProcessWithoutNullStreams
     cancellationReason: HookCancellationReason | undefined
     clearAbortListener: (() => void) | undefined
 }
 
+const HOOK_PROTOCOL_VERSION = 1 as const
+const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
+const emptyHookOutputSchema = {
+    type: "object",
+    additionalProperties: false,
+} as const
+const permissiveHookOutputSchema = {
+    type: "object",
+} as const
+const hookStdoutEnvelopeSchema = {
+    type: "object",
+    required: ["version", "event", "output"],
+    additionalProperties: false,
+    properties: {
+        version: { const: HOOK_PROTOCOL_VERSION },
+        event: { type: "string" },
+        output: { type: "object" },
+    },
+} as const
+
 const EMPTY_REGISTRY: HookRegistry = { files: [] }
 let activeRegistry: HookRegistry = EMPTY_REGISTRY
 let activeHookExecutions = new Set<ActiveHookExecution>()
 
 const hooksSchema = loadHooksSchema()
-const validateHooksSchema = compileHooksSchemaValidator(hooksSchema)
+const validateHooksSchema = compileJsonSchemaValidator(hooksSchema)
+const validateHookStdoutEnvelope = compileJsonSchemaValidator(hookStdoutEnvelopeSchema)
 const allowedEventNames = loadAllowedEventNames(hooksSchema)
+const validateHookStdoutOutputByEvent = compileHookStdoutOutputValidators(allowedEventNames)
 
 export async function loadUserHooksRegistry(options: { homeDir?: string } = {}): Promise<HookRegistry> {
     const homeDir = options.homeDir ?? homedir()
@@ -582,13 +624,24 @@ function loadHooksSchema(): SchemaDocument {
     return JSON.parse(readFileSync(schemaPath, "utf8")) as SchemaDocument
 }
 
-function compileHooksSchemaValidator(schema: SchemaDocument): ValidateFunction {
+function compileJsonSchemaValidator(schema: object): ValidateFunction {
     const ajv = new Ajv2020({ allErrors: true, strict: false })
     return ajv.compile(schema)
 }
 
 function loadAllowedEventNames(schema: SchemaDocument) {
     return new Set(Object.keys(schema.properties?.hooks?.properties ?? {}))
+}
+
+function compileHookStdoutOutputValidators(eventNames: Set<string>) {
+    return new Map(
+        [...eventNames].map((eventName) => [
+            eventName,
+            compileJsonSchemaValidator(
+                SEMANTIC_STDOUT_EVENT_NAMES.has(eventName) ? permissiveHookOutputSchema : emptyHookOutputSchema,
+            ),
+        ]),
+    )
 }
 
 function parseJsonObject(text: string, sourcePath: string) {
@@ -791,6 +844,80 @@ function cancelActiveHookExecutions(reason: HookCancellationReason) {
     }
 }
 
+function createHookStdinEnvelope(options: {
+    eventName: string
+    sourcePath: string
+    matcher: LoadedMatcher
+    cwd: string
+    event: unknown
+}): HookStdinEnvelope {
+    return {
+        version: HOOK_PROTOCOL_VERSION,
+        event: options.eventName,
+        sourcePath: options.sourcePath,
+        matcher: options.matcher,
+        cwd: options.cwd,
+        payload: serializeJsonObject(options.event),
+    }
+}
+
+function parseHookStdout(options: { stdout: string; eventName: string }): HookStdoutParseResult {
+    if (options.stdout.trim() === "") {
+        return { kind: "empty" }
+    }
+
+    let parsed: JsonValue
+
+    try {
+        parsed = JSON.parse(options.stdout) as JsonValue
+    } catch (error) {
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stdout for ${options.eventName}: ${(error as Error).message}`,
+        }
+    }
+
+    if (!isJsonObject(parsed)) {
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stdout for ${options.eventName}: expected a JSON object`,
+        }
+    }
+
+    if (!validateHookStdoutEnvelope(parsed)) {
+        const details = (validateHookStdoutEnvelope.errors ?? []).map(formatSchemaError).join("; ")
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stdout for ${options.eventName}: ${details || "schema validation failed"}`,
+        }
+    }
+
+    if (parsed.event !== options.eventName) {
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stdout for ${options.eventName}: envelope event ${parsed.event} does not match fired event`,
+        }
+    }
+
+    const validateOutput = validateHookStdoutOutputByEvent.get(options.eventName)
+    if (validateOutput === undefined) {
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stdout for ${options.eventName}: unsupported event`,
+        }
+    }
+
+    if (!validateOutput(parsed.output)) {
+        const details = (validateOutput.errors ?? []).map(formatSchemaError).join("; ")
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stdout for ${options.eventName}: ${details || "output validation failed"}`,
+        }
+    }
+
+    return { kind: "valid", envelope: parsed as HookStdoutEnvelope }
+}
+
 function dispatchProjectTrustHooks(event: ProjectTrustEvent, ctx: ProjectTrustContext, registry: HookRegistry) {
     for (const file of registry.files) {
         for (const registration of file.events) {
@@ -807,12 +934,13 @@ function dispatchProjectTrustHooks(event: ProjectTrustEvent, ctx: ProjectTrustCo
                     void runCommandHook({
                         hook,
                         cwd: ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
-                        },
+                            cwd: ctx.cwd,
+                            event,
+                        }),
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -840,12 +968,13 @@ function dispatchModelSelectHooks(event: ModelSelectEvent, ctx: ExtensionContext
                     void runCommandHook({
                         hook,
                         cwd: ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
-                        },
+                            cwd: ctx.cwd,
+                            event,
+                        }),
                         abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
@@ -874,12 +1003,13 @@ function dispatchThinkingLevelSelectHooks(event: ThinkingLevelSelectEvent, ctx: 
                     void runCommandHook({
                         hook,
                         cwd: ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
-                        },
+                            cwd: ctx.cwd,
+                            event,
+                        }),
                         abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
@@ -1001,12 +1131,13 @@ function dispatchReasonMatchedHooks(
                     void runCommandHook({
                         hook,
                         cwd: ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
-                        },
+                            cwd: ctx.cwd,
+                            event,
+                        }),
                         abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
@@ -1035,12 +1166,13 @@ function dispatchMatchAllHooks(
                     void runCommandHook({
                         hook,
                         cwd: ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
-                        },
+                            cwd: ctx.cwd,
+                            event,
+                        }),
                         abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
@@ -1105,12 +1237,13 @@ function dispatchTextMatchedHooks(options: {
                     void runCommandHook({
                         hook,
                         cwd: options.ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(options.event),
-                        },
+                            cwd: options.ctx.cwd,
+                            event: options.event,
+                        }),
                         reportFailures: options.reportFailures,
                         abortSignal: getHookAbortSignal(options.event, options.ctx),
                     }).catch((error: unknown) => {
@@ -1168,12 +1301,13 @@ function dispatchToolNamedHooks(
                     void runCommandHook({
                         hook,
                         cwd: ctx.cwd,
-                        payload: {
-                            event: registration.eventName,
+                        payload: createHookStdinEnvelope({
+                            eventName: registration.eventName,
                             sourcePath: file.sourcePath,
                             matcher: matcherGroup.normalizedMatcher,
-                            payload: serializeJsonObject(event),
-                        },
+                            cwd: ctx.cwd,
+                            event,
+                        }),
                         abortSignal: getHookAbortSignal(event, ctx),
                     }).catch((error: unknown) => {
                         console.warn(
@@ -1214,7 +1348,7 @@ function isAbortSignal(value: unknown): value is AbortSignal {
 async function runCommandHook(options: {
     hook: LoadedHook
     cwd: string
-    payload: JsonObject
+    payload: HookStdinEnvelope
     reportFailures?: boolean
     abortSignal?: AbortSignal
 }) {
@@ -1326,6 +1460,19 @@ async function runCommandHook(options: {
     }
 
     if (exitCode === 0) {
+        const parsedStdout = parseHookStdout({ stdout, eventName: options.payload.event })
+        if (parsedStdout.kind === "invalid") {
+            console.warn(`${parsedStdout.warning}\nstdout: ${stdout}\nstderr: ${stderr}`)
+            return
+        }
+
+        if (parsedStdout.kind === "valid") {
+            console.warn(
+                `Ignoring hook stdout for ${options.payload.event}: semantic output is not supported yet\nstdout: ${stdout}\nstderr: ${stderr}`,
+            )
+            return parsedStdout.envelope
+        }
+
         return
     }
 
