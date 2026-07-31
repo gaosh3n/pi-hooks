@@ -34,6 +34,11 @@ type InputEvent = {
     streamingBehavior?: "steer" | "followUp"
 }
 
+type InputEventResult =
+    | { action: "continue" }
+    | { action: "transform"; text: string; images?: unknown[] }
+    | { action: "handled" }
+
 type ProjectTrustEvent = {
     type: "project_trust"
     cwd: string
@@ -263,7 +268,9 @@ function getUserBashHandler(handlers: Partial<Record<string, (...args: unknown[]
 }
 
 function getInputHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
-    return handlers.input as ((event: InputEvent, ctx: ExtensionContext) => Promise<void> | undefined) | undefined
+    return handlers.input as
+        | ((event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult> | undefined)
+        | undefined
 }
 
 function getProjectTrustHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
@@ -352,6 +359,10 @@ function createNodeCwdCommand(outputPath: string) {
 
 function createStdoutHookCommand(stdout: string) {
     return `node --input-type=module -e "process.stdout.write(process.argv[1]);" ${JSON.stringify(stdout)}`
+}
+
+function createLatestInputTransformHookCommand(suffix: string) {
+    return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);process.stdout.write(JSON.stringify({version:1,event:'input',output:{action:'transform',text:String(payload.payload.text)+process.argv[1]}}));});" ${JSON.stringify(suffix)}`
 }
 
 function createLongRunningHookCommand(options: { startedPath: string; resultPath: string; completeAfterMs: number }) {
@@ -3691,10 +3702,9 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("does not block or mutate input handling", async () => {
+    it("returns transformed input from valid semantic stdout", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
-        const outputPath = join(projectDir, "slow-input.json")
 
         await mkdir(join(projectDir, ".pi"), { recursive: true })
         await writeFile(
@@ -3707,8 +3717,16 @@ describe("pi hooks loader", () => {
                             hooks: [
                                 {
                                     type: "command",
-                                    timeout: 5,
-                                    command: `node --input-type=module -e "import('node:fs').then(fs=>{setTimeout(()=>fs.writeFileSync(process.argv[1],'done'),150);});" ${JSON.stringify(outputPath)}`,
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "input",
+                                            output: {
+                                                action: "transform",
+                                                text: "hello world from hook",
+                                            },
+                                        }),
+                                    ),
                                 },
                             ],
                         },
@@ -3736,23 +3754,20 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            const event: InputEvent = {
-                type: "input",
-                text: "hello world",
-                source: "interactive",
-                streamingBehavior: "followUp",
-            }
-
-            expect(input?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
-            expect(event).toEqual({
-                type: "input",
-                text: "hello world",
-                source: "interactive",
-                streamingBehavior: "followUp",
-            })
-            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
-            await vi.waitFor(async () => {
-                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            await expect(
+                input?.(
+                    {
+                        type: "input",
+                        text: "hello world",
+                        source: "interactive",
+                        streamingBehavior: "followUp",
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({
+                action: "transform",
+                text: "hello world from hook",
+                images: undefined,
             })
         } finally {
             process.env.HOME = previousHome
@@ -3760,7 +3775,244 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("suppresses non-zero input hook warnings without crashing input handling", async () => {
+    it("returns continue when valid semantic stdout leaves input unchanged", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    input: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "input",
+                                            output: { action: "continue" },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const input = getInputHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                input?.(
+                    {
+                        type: "input",
+                        text: "hello world",
+                        source: "interactive",
+                        streamingBehavior: "followUp",
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({ action: "continue" })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("composes multiple valid input transforms in configured order over the latest state", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    input: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "input",
+                                            output: {
+                                                action: "transform",
+                                                text: "hello world + first",
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createLatestInputTransformHookCommand(" + second"),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const input = getInputHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                input?.(
+                    {
+                        type: "input",
+                        text: "hello world",
+                        source: "interactive",
+                        streamingBehavior: "followUp",
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({
+                action: "transform",
+                text: "hello world + first + second",
+                images: undefined,
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("stops input semantic processing at the first valid handled result while warning on malformed and unsupported stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const afterHandledPath = join(projectDir, "input-after-handled.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    input: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                { type: "command", command: createStdoutHookCommand("{not valid json") },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "input",
+                                            output: { systemPrompt: "not allowed" },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "input",
+                                            output: { action: "transform", text: "hello world + first" },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({ version: 1, event: "input", output: { action: "handled" } }),
+                                    ),
+                                },
+                                { type: "command", command: createNodeHookCommand(afterHandledPath) },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const input = getInputHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                input?.(
+                    {
+                        type: "input",
+                        text: "hello world",
+                        source: "interactive",
+                        streamingBehavior: "followUp",
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({ action: "handled" })
+
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring invalid hook stdout for input"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("systemPrompt"))
+            })
+            await new Promise((resolve) => setTimeout(resolve, 50))
+            await expect(readFile(afterHandledPath, "utf8")).rejects.toThrow()
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports non-zero input hook failures without crashing input handling", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
 
@@ -3804,7 +4056,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 input?.(
                     {
                         type: "input",
@@ -3814,9 +4066,8 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
-            await new Promise((resolve) => setTimeout(resolve, 100))
-            expect(warn).not.toHaveBeenCalled()
+            ).resolves.toEqual({ action: "continue" })
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed with exit code 7"))
         } finally {
             warn.mockRestore()
             process.env.HOME = previousHome
@@ -3824,7 +4075,7 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("suppresses input hook spawn-failure warnings without crashing input handling", async () => {
+    it("reports input hook spawn failures without crashing input handling", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
 
@@ -3868,7 +4119,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 input?.(
                     {
                         type: "input",
@@ -3878,9 +4129,8 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
                 ),
-            ).toBeUndefined()
-            await new Promise((resolve) => setTimeout(resolve, 100))
-            expect(warn).not.toHaveBeenCalled()
+            ).resolves.toEqual({ action: "continue" })
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
         } finally {
             warn.mockRestore()
             process.env.HOME = previousHome
@@ -3888,7 +4138,7 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("suppresses timed out input hook warnings without crashing input handling", async () => {
+    it("reports timed out input hook failures without crashing input handling", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
 
@@ -3933,7 +4183,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 input?.(
                     {
                         type: "input",
@@ -3943,9 +4193,8 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
-            await new Promise((resolve) => setTimeout(resolve, 150))
-            expect(warn).not.toHaveBeenCalled()
+            ).resolves.toEqual({ action: "continue" })
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command timed out after 0.05s"))
         } finally {
             warn.mockRestore()
             process.env.HOME = previousHome

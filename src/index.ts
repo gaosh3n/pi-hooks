@@ -9,6 +9,7 @@ import type { ErrorObject, ValidateFunction } from "ajv"
 import type {
     ExtensionAPI,
     ExtensionContext,
+    InputEventResult,
     SessionStartEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -336,6 +337,11 @@ type HookStdoutParseResult =
     | { kind: "invalid"; warning: string }
     | { kind: "valid"; envelope: HookStdoutEnvelope }
 
+type InputHookResult =
+    | { action: "continue" }
+    | { action: "transform"; text: string; images?: unknown[] }
+    | { action: "handled" }
+
 type ActiveHookExecution = {
     child: ChildProcessWithoutNullStreams
     cancellationReason: HookCancellationReason | undefined
@@ -350,6 +356,36 @@ const emptyHookOutputSchema = {
 } as const
 const permissiveHookOutputSchema = {
     type: "object",
+} as const
+const inputHookOutputSchema = {
+    anyOf: [
+        {
+            type: "object",
+            required: ["action"],
+            additionalProperties: false,
+            properties: {
+                action: { const: "continue" },
+            },
+        },
+        {
+            type: "object",
+            required: ["action", "text"],
+            additionalProperties: false,
+            properties: {
+                action: { const: "transform" },
+                text: { type: "string" },
+                images: { type: "array", items: {} },
+            },
+        },
+        {
+            type: "object",
+            required: ["action"],
+            additionalProperties: false,
+            properties: {
+                action: { const: "handled" },
+            },
+        },
+    ],
 } as const
 const hookStdoutEnvelopeSchema = {
     type: "object",
@@ -522,8 +558,9 @@ export default function setup(pi: ExtensionAPI) {
         dispatchBeforeAgentStartHooks(event, ctx)
     })
 
-    pi.on("input", (event: InputEvent, ctx: ExtensionContext) => {
-        dispatchInputHooks(event, ctx)
+    pi.on("input", async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
+        const result = await dispatchInputHooks(event, ctx)
+        return result as InputEventResult
     })
 
     pi.on("user_bash", (event: UserBashEvent, ctx: ExtensionContext) => {
@@ -637,11 +674,21 @@ function compileHookStdoutOutputValidators(eventNames: Set<string>) {
     return new Map(
         [...eventNames].map((eventName) => [
             eventName,
-            compileJsonSchemaValidator(
-                SEMANTIC_STDOUT_EVENT_NAMES.has(eventName) ? permissiveHookOutputSchema : emptyHookOutputSchema,
-            ),
+            compileJsonSchemaValidator(getHookStdoutOutputSchema(eventName)),
         ]),
     )
+}
+
+function getHookStdoutOutputSchema(eventName: string) {
+    if (eventName === "input") {
+        return inputHookOutputSchema
+    }
+
+    if (SEMANTIC_STDOUT_EVENT_NAMES.has(eventName)) {
+        return permissiveHookOutputSchema
+    }
+
+    return emptyHookOutputSchema
 }
 
 function parseJsonObject(text: string, sourcePath: string) {
@@ -1195,14 +1242,71 @@ function dispatchBeforeAgentStartHooks(event: BeforeAgentStartEvent, ctx: Extens
     })
 }
 
-function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext) {
-    dispatchTextMatchedHooks({
-        eventName: "input",
-        event,
-        subject: event.text,
-        ctx,
-        reportFailures: false,
-    })
+async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Promise<InputHookResult> {
+    let currentText = event.text
+    let currentImages = event.images
+
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "input") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, currentText)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    let stdoutEnvelope: HookStdoutEnvelope | undefined
+
+                    try {
+                        stdoutEnvelope = await runCommandHook({
+                            hook,
+                            cwd: ctx.cwd,
+                            payload: createHookStdinEnvelope({
+                                eventName: registration.eventName,
+                                sourcePath: file.sourcePath,
+                                matcher: matcherGroup.normalizedMatcher,
+                                cwd: ctx.cwd,
+                                event: {
+                                    ...event,
+                                    text: currentText,
+                                    images: currentImages,
+                                },
+                            }),
+                            reportFailures: true,
+                            abortSignal: getHookAbortSignal(event, ctx),
+                            consumeStdout: true,
+                        })
+                    } catch (error) {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                        continue
+                    }
+
+                    if (stdoutEnvelope === undefined) {
+                        continue
+                    }
+
+                    const output = stdoutEnvelope.output as InputHookResult
+                    if (output.action === "handled") {
+                        return output
+                    }
+
+                    if (output.action === "transform") {
+                        currentText = output.text
+                        currentImages = output.images ?? currentImages
+                    }
+                }
+            }
+        }
+    }
+
+    return currentText !== event.text || currentImages !== event.images
+        ? { action: "transform", text: currentText, images: currentImages }
+        : { action: "continue" }
 }
 
 function dispatchUserBashHooks(event: UserBashEvent, ctx: ExtensionContext) {
@@ -1351,7 +1455,8 @@ async function runCommandHook(options: {
     payload: HookStdinEnvelope
     reportFailures?: boolean
     abortSignal?: AbortSignal
-}) {
+    consumeStdout?: boolean
+}): Promise<HookStdoutEnvelope | undefined> {
     const child = spawn(options.hook.command, {
         cwd: options.cwd,
         env: process.env,
@@ -1467,6 +1572,10 @@ async function runCommandHook(options: {
         }
 
         if (parsedStdout.kind === "valid") {
+            if (options.consumeStdout) {
+                return parsedStdout.envelope
+            }
+
             console.warn(
                 `Ignoring hook stdout for ${options.payload.event}: semantic output is not supported yet\nstdout: ${stdout}\nstderr: ${stderr}`,
             )
