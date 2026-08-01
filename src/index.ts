@@ -354,6 +354,14 @@ type ToolCallHookResult =
           }
       }
 
+type ToolResultEventResult = {
+    content?: unknown[]
+    details?: unknown
+    isError?: boolean
+}
+
+type ToolResultHookResult = ToolResultEventResult
+
 type BeforeAgentStartHookSlot = {
     sourcePath: string
     matcher: LoadedMatcher
@@ -451,6 +459,49 @@ const toolCallHookOutputSchema = {
             },
         },
     ],
+} as const
+const toolResultHookOutputSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        content: {
+            type: "array",
+            items: {
+                anyOf: [
+                    {
+                        type: "object",
+                        required: ["type", "text"],
+                        additionalProperties: false,
+                        properties: {
+                            type: { const: "text" },
+                            text: { type: "string" },
+                        },
+                    },
+                    {
+                        type: "object",
+                        required: ["type", "source"],
+                        additionalProperties: false,
+                        properties: {
+                            type: { const: "image" },
+                            source: {
+                                type: "object",
+                                required: ["type", "mediaType", "data"],
+                                additionalProperties: false,
+                                properties: {
+                                    type: { const: "base64" },
+                                    mediaType: { type: "string" },
+                                    data: { type: "string" },
+                                },
+                            },
+                        },
+                    },
+                ],
+            },
+        },
+        details: {},
+        isError: { type: "boolean" },
+    },
+    anyOf: [{ required: ["content"] }, { required: ["details"] }, { required: ["isError"] }],
 } as const
 const hookStdoutEnvelopeSchema = {
     type: "object",
@@ -681,9 +732,19 @@ export default function setup(pi: ExtensionAPI) {
         },
     )
 
-    pi.on("tool_result", (event: ToolResultEvent, ctx: ExtensionContext) => {
-        dispatchToolResultHooks(event, ctx)
-    })
+    ;(
+        pi as ExtensionAPI & {
+            on(
+                event: "tool_result",
+                handler: (event: ToolResultEvent, ctx: ExtensionContext) => Promise<ToolResultEventResult | undefined>,
+            ): void
+        }
+    ).on(
+        "tool_result",
+        async (event: ToolResultEvent, ctx: ExtensionContext): Promise<ToolResultEventResult | undefined> => {
+            return dispatchToolResultHooks(event, ctx)
+        },
+    )
 
     pi.on("tool_execution_start", (event: ToolExecutionStartEvent, ctx: ExtensionContext) => {
         dispatchToolExecutionStartHooks(event, ctx)
@@ -800,6 +861,10 @@ function getHookStdoutOutputSchema(eventName: string) {
 
     if (eventName === "tool_call") {
         return toolCallHookOutputSchema
+    }
+
+    if (eventName === "tool_result") {
+        return toolResultHookOutputSchema
     }
 
     if (SEMANTIC_STDOUT_EVENT_NAMES.has(eventName)) {
@@ -1588,8 +1653,88 @@ async function dispatchToolCallHooks(
     return undefined
 }
 
-function dispatchToolResultHooks(event: ToolResultEvent, ctx: ExtensionContext) {
-    dispatchToolNamedHooks("tool_result", event, ctx)
+async function dispatchToolResultHooks(
+    event: ToolResultEvent,
+    ctx: ExtensionContext,
+): Promise<ToolResultEventResult | undefined> {
+    let currentContent = serializeJsonArray(event.content)
+    let currentDetails = serializeJsonValue(event.details)
+    let currentIsError = event.isError
+
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "tool_result") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.toolName)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    let stdoutEnvelope: HookStdoutEnvelope | undefined
+
+                    try {
+                        stdoutEnvelope = await runCommandHook({
+                            hook,
+                            cwd: ctx.cwd,
+                            payload: createHookStdinEnvelope({
+                                eventName: registration.eventName,
+                                sourcePath: file.sourcePath,
+                                matcher: matcherGroup.normalizedMatcher,
+                                cwd: ctx.cwd,
+                                event: {
+                                    ...event,
+                                    content: currentContent,
+                                    details: currentDetails,
+                                    isError: currentIsError,
+                                },
+                            }),
+                            reportFailures: true,
+                            abortSignal: getHookAbortSignal(event, ctx),
+                            consumeStdout: true,
+                        })
+                    } catch (error) {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                        continue
+                    }
+
+                    if (stdoutEnvelope === undefined) {
+                        continue
+                    }
+
+                    const output = stdoutEnvelope.output as ToolResultHookResult
+                    if (output.content !== undefined) {
+                        currentContent = serializeJsonArray(output.content)
+                    }
+
+                    if (Object.prototype.hasOwnProperty.call(output, "details")) {
+                        currentDetails = serializeJsonValue(output.details)
+                    }
+
+                    if (output.isError !== undefined) {
+                        currentIsError = output.isError
+                    }
+                }
+            }
+        }
+    }
+
+    const result: ToolResultEventResult = {}
+    if (!jsonValuesEqual(currentContent, serializeJsonArray(event.content))) {
+        result.content = currentContent as ToolResultEventResult["content"]
+    }
+    if (!jsonValuesEqual(currentDetails, serializeJsonValue(event.details))) {
+        result.details = currentDetails
+    }
+    if (currentIsError !== event.isError) {
+        result.isError = currentIsError
+    }
+
+    return Object.keys(result).length === 0 ? undefined : result
 }
 
 function dispatchToolExecutionStartHooks(event: ToolExecutionStartEvent, ctx: ExtensionContext) {
@@ -1821,6 +1966,22 @@ async function runCommandHook(options: {
 
 function serializeJsonObject(value: unknown): JsonObject {
     return JSON.parse(JSON.stringify(value)) as JsonObject
+}
+
+function serializeJsonArray(value: unknown): JsonValue[] {
+    return JSON.parse(JSON.stringify(value)) as JsonValue[]
+}
+
+function serializeJsonValue(value: unknown): JsonValue | undefined {
+    if (value === undefined) {
+        return undefined
+    }
+
+    return JSON.parse(JSON.stringify(value)) as JsonValue
+}
+
+function jsonValuesEqual(left: JsonValue | undefined, right: JsonValue | undefined) {
+    return JSON.stringify(left) === JSON.stringify(right)
 }
 
 function toErrorMessage(error: unknown) {

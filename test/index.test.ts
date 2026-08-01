@@ -54,6 +54,12 @@ type ToolCallEventResult = {
     reason?: string
 }
 
+type ToolResultEventResult = {
+    content?: unknown[]
+    details?: unknown
+    isError?: boolean
+}
+
 type RegisteredHandler = (...args: unknown[]) => unknown
 type HandlerRegistry = Partial<Record<string, RegisteredHandler | RegisteredHandler[]>>
 
@@ -412,7 +418,7 @@ function getToolCallHandler(handlers: HandlerRegistry) {
 
 function getToolResultHandler(handlers: HandlerRegistry) {
     return handlers.tool_result as
-        | ((event: ToolResultEvent, ctx: ExtensionContext) => Promise<void> | undefined)
+        | ((event: ToolResultEvent, ctx: ExtensionContext) => Promise<ToolResultEventResult | undefined>)
         | undefined
 }
 
@@ -456,6 +462,14 @@ function createLatestBeforeAgentStartHookCommand(options: {
     systemPromptSuffix?: string
 }) {
     return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);const output={message:{customType:process.argv[1],content:process.argv[2]}};if(process.argv[3])output.systemPrompt=String(payload.payload.systemPrompt)+process.argv[3];process.stdout.write(JSON.stringify({version:1,event:'before_agent_start',output}));});" ${JSON.stringify(options.messageType)} ${JSON.stringify(options.messageContent)} ${JSON.stringify(options.systemPromptSuffix ?? "")}`
+}
+
+function createLatestToolResultPatchHookCommand(output: {
+    contentText?: string
+    details?: unknown
+    isError?: boolean
+}) {
+    return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);const output={};if(process.argv[1])output.content=[{type:'text',text:String(payload.payload.content[0]?.text ?? '')+process.argv[1]}];if(process.argv[2])output.details=JSON.parse(process.argv[2]);if(process.argv[3])output.isError=process.argv[3]==='true';process.stdout.write(JSON.stringify({version:1,event:'tool_result',output}));});" ${JSON.stringify(output.contentText ?? "")} ${JSON.stringify(output.details === undefined ? "" : JSON.stringify(output.details))} ${JSON.stringify(output.isError === undefined ? "" : String(output.isError))}`
 }
 
 function createLatestToolCallInputHookCommand(suffix: string) {
@@ -4932,6 +4946,69 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("returns patched tool result from valid semantic stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createLatestToolResultPatchHookCommand({ contentText: " + patched" }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                toolResult?.(
+                    {
+                        type: "tool_result",
+                        toolCallId: "call-1",
+                        toolName: "custom-tool",
+                        input: { step: "draft" },
+                        content: [{ type: "text", text: "hello" }],
+                        details: { phase: "draft" },
+                        isError: false,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({ content: [{ type: "text", text: "hello + patched" }] })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("runs matching tool_result hooks with canonical payload in the active session cwd", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
@@ -5164,7 +5241,84 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("does not block or mutate tool_result handling", async () => {
+    it("composes multiple valid tool_result patches in configured order over the latest state", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createLatestToolResultPatchHookCommand({
+                                        contentText: " + first",
+                                        details: { phase: "patched" },
+                                    }),
+                                },
+                                {
+                                    type: "command",
+                                    command: createLatestToolResultPatchHookCommand({
+                                        contentText: " + second",
+                                        isError: true,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                toolResult?.(
+                    {
+                        type: "tool_result",
+                        toolCallId: "call-1",
+                        toolName: "custom-tool",
+                        input: { step: "draft" },
+                        content: [{ type: "text", text: "hello" }],
+                        details: { phase: "draft" },
+                        isError: false,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({
+                content: [{ type: "text", text: "hello + first + second" }],
+                details: { phase: "patched" },
+                isError: true,
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("waits for tool_result semantic hooks before returning without mutating the event object", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const outputPath = join(projectDir, "slow-tool-result.json")
@@ -5219,7 +5373,7 @@ describe("pi hooks loader", () => {
                 details: undefined,
             }
 
-            expect(toolResult?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            await expect(toolResult?.(event, createExtensionContext(canonicalProjectDir))).resolves.toBeUndefined()
             expect(event).toEqual({
                 type: "tool_result",
                 toolCallId: "call-1",
@@ -5229,10 +5383,7 @@ describe("pi hooks loader", () => {
                 isError: false,
                 details: undefined,
             })
-            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
-            await vi.waitFor(async () => {
-                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
-            })
+            await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
@@ -5457,7 +5608,192 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("reports non-zero tool_result hook exits without crashing tool result handling", async () => {
+    it("warns and ignores semantically unsupported tool_result content items while allowing later valid patches", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "tool_result",
+                                            output: {
+                                                content: [123],
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "tool_result",
+                                            output: {
+                                                content: [{ type: "text", text: "patched" }],
+                                            },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                toolResult?.(
+                    {
+                        type: "tool_result",
+                        toolCallId: "call-1",
+                        toolName: "custom-tool",
+                        input: { step: "draft" },
+                        content: [{ type: "text", text: "hello" }],
+                        details: { phase: "draft" },
+                        isError: false,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({
+                content: [{ type: "text", text: "patched" }],
+            })
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring invalid hook stdout for tool_result"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("content/0"))
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("warns and ignores malformed and unsupported tool_result stdout without blocking valid later patches", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_result: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                { type: "command", command: createStdoutHookCommand("{not valid json") },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "tool_result",
+                                            output: {
+                                                content: [{ type: "text", text: "ignored" }],
+                                                extra: true,
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "tool_result",
+                                            output: {
+                                                content: [{ type: "text", text: "patched" }],
+                                                details: { phase: "final" },
+                                                isError: true,
+                                            },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolResult = getToolResultHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                toolResult?.(
+                    {
+                        type: "tool_result",
+                        toolCallId: "call-1",
+                        toolName: "custom-tool",
+                        input: { step: "draft" },
+                        content: [{ type: "text", text: "hello" }],
+                        details: { phase: "draft" },
+                        isError: false,
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({
+                content: [{ type: "text", text: "patched" }],
+                details: { phase: "final" },
+                isError: true,
+            })
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring invalid hook stdout for tool_result"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("not valid json"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property extra"))
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("reports non-zero tool_result hook exits without blocking tool result handling", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
 
@@ -5501,7 +5837,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 toolResult?.(
                     {
                         type: "tool_result",
@@ -5514,7 +5850,7 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
+            ).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
