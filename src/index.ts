@@ -7,6 +7,7 @@ import { isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { ErrorObject, ValidateFunction } from "ajv"
 import type {
+    BeforeAgentStartEventResult,
     ExtensionAPI,
     ExtensionContext,
     InputEventResult,
@@ -342,6 +343,14 @@ type InputHookResult =
     | { action: "transform"; text: string; images?: unknown[] }
     | { action: "handled" }
 
+type BeforeAgentStartHookResult = BeforeAgentStartEventResult
+
+type BeforeAgentStartHookSlot = {
+    sourcePath: string
+    matcher: LoadedMatcher
+    hook: LoadedHook
+}
+
 type ActiveHookExecution = {
     child: ChildProcessWithoutNullStreams
     cancellationReason: HookCancellationReason | undefined
@@ -387,6 +396,25 @@ const inputHookOutputSchema = {
         },
     ],
 } as const
+const beforeAgentStartHookOutputSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        message: {
+            type: "object",
+            required: ["customType", "content"],
+            additionalProperties: false,
+            properties: {
+                customType: { type: "string" },
+                content: {},
+                display: { type: "boolean" },
+                details: {},
+            },
+        },
+        systemPrompt: { type: "string" },
+    },
+    anyOf: [{ required: ["message"] }, { required: ["systemPrompt"] }],
+} as const
 const hookStdoutEnvelopeSchema = {
     type: "object",
     required: ["version", "event", "output"],
@@ -400,6 +428,7 @@ const hookStdoutEnvelopeSchema = {
 
 const EMPTY_REGISTRY: HookRegistry = { files: [] }
 let activeRegistry: HookRegistry = EMPTY_REGISTRY
+let activeBeforeAgentStartSlots: BeforeAgentStartHookSlot[] = []
 let activeHookExecutions = new Set<ActiveHookExecution>()
 
 const hooksSchema = loadHooksSchema()
@@ -444,9 +473,53 @@ export function getHookRegistry(): HookRegistry {
     return activeRegistry
 }
 
+function compileBeforeAgentStartHookSlots(registry: HookRegistry): BeforeAgentStartHookSlot[] {
+    const slots: BeforeAgentStartHookSlot[] = []
+
+    for (const file of registry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "before_agent_start") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                for (const hook of matcherGroup.hooks) {
+                    slots.push({
+                        sourcePath: file.sourcePath,
+                        matcher: matcherGroup.normalizedMatcher,
+                        hook,
+                    })
+                }
+            }
+        }
+    }
+
+    return slots
+}
+
 export default function setup(pi: ExtensionAPI) {
+    let registeredBeforeAgentStartSlotCount = 0
+
+    const ensureBeforeAgentStartSlotHandlers = (slotCount: number) => {
+        while (registeredBeforeAgentStartSlotCount < slotCount) {
+            const slotIndex = registeredBeforeAgentStartSlotCount
+            pi.on(
+                "before_agent_start",
+                async (
+                    event: BeforeAgentStartEvent,
+                    ctx: ExtensionContext,
+                ): Promise<BeforeAgentStartEventResult | undefined> => {
+                    return await dispatchBeforeAgentStartHookSlot(slotIndex, event, ctx)
+                },
+            )
+            registeredBeforeAgentStartSlotCount += 1
+        }
+    }
+
     pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
         activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
+        activeBeforeAgentStartSlots = compileBeforeAgentStartHookSlots(activeRegistry)
+        ensureBeforeAgentStartSlotHandlers(activeBeforeAgentStartSlots.length)
         dispatchSessionStartHooks(event, ctx)
     })
 
@@ -550,12 +623,9 @@ export default function setup(pi: ExtensionAPI) {
     pi.on("session_shutdown", (event: SessionShutdownEvent, ctx: ExtensionContext) => {
         const registryAtShutdown = activeRegistry
         activeRegistry = EMPTY_REGISTRY
+        activeBeforeAgentStartSlots = []
         cancelActiveHookExecutions("shutdown")
         dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
-    })
-
-    pi.on("before_agent_start", (event: BeforeAgentStartEvent, ctx: ExtensionContext) => {
-        dispatchBeforeAgentStartHooks(event, ctx)
     })
 
     pi.on("input", async (event: InputEvent, ctx: ExtensionContext): Promise<InputEventResult> => {
@@ -682,6 +752,10 @@ function compileHookStdoutOutputValidators(eventNames: Set<string>) {
 function getHookStdoutOutputSchema(eventName: string) {
     if (eventName === "input") {
         return inputHookOutputSchema
+    }
+
+    if (eventName === "before_agent_start") {
+        return beforeAgentStartHookOutputSchema
     }
 
     if (SEMANTIC_STDOUT_EVENT_NAMES.has(eventName)) {
@@ -1232,14 +1306,52 @@ function dispatchMatchAllHooks(
     }
 }
 
-function dispatchBeforeAgentStartHooks(event: BeforeAgentStartEvent, ctx: ExtensionContext) {
-    dispatchTextMatchedHooks({
-        eventName: "before_agent_start",
-        event,
-        subject: event.prompt,
-        ctx,
-        reportFailures: true,
-    })
+async function dispatchBeforeAgentStartHookSlot(
+    slotIndex: number,
+    event: BeforeAgentStartEvent,
+    ctx: ExtensionContext,
+): Promise<BeforeAgentStartEventResult | undefined> {
+    const slot = activeBeforeAgentStartSlots[slotIndex]
+    if (slot === undefined) {
+        return undefined
+    }
+
+    if (!matchesLoadedMatcher(slot.matcher, event.prompt)) {
+        return undefined
+    }
+
+    let stdoutEnvelope: HookStdoutEnvelope | undefined
+
+    try {
+        stdoutEnvelope = await runCommandHook({
+            hook: slot.hook,
+            cwd: ctx.cwd,
+            payload: createHookStdinEnvelope({
+                eventName: "before_agent_start",
+                sourcePath: slot.sourcePath,
+                matcher: slot.matcher,
+                cwd: ctx.cwd,
+                event,
+            }),
+            reportFailures: true,
+            abortSignal: getHookAbortSignal(event, ctx),
+            consumeStdout: true,
+        })
+    } catch (error) {
+        console.warn(`Hook command failed before completion: ${slot.hook.command} (${toErrorMessage(error)})`)
+        return undefined
+    }
+
+    if (stdoutEnvelope === undefined) {
+        return undefined
+    }
+
+    const output = stdoutEnvelope.output as BeforeAgentStartHookResult
+    if (output.message === undefined && output.systemPrompt === undefined) {
+        return undefined
+    }
+
+    return output
 }
 
 async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Promise<InputHookResult> {

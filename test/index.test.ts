@@ -39,6 +39,19 @@ type InputEventResult =
     | { action: "transform"; text: string; images?: unknown[] }
     | { action: "handled" }
 
+type BeforeAgentStartEventResult = {
+    message?: {
+        customType: string
+        content: unknown
+        display?: boolean
+        details?: unknown
+    }
+    systemPrompt?: string
+}
+
+type RegisteredHandler = (...args: unknown[]) => unknown
+type HandlerRegistry = Partial<Record<string, RegisteredHandler | RegisteredHandler[]>>
+
 type ProjectTrustEvent = {
     type: "project_trust"
     cwd: string
@@ -234,116 +247,181 @@ async function makeTempHome() {
 }
 
 function createExtensionApiDouble() {
-    const handlers: Partial<Record<string, (...args: unknown[]) => unknown>> = {}
+    const handlers: HandlerRegistry = {}
+    const sendMessage = vi.fn()
     const pi = {
         on(event: string, handler: (...args: unknown[]) => unknown) {
-            handlers[event] = handler
-        },
-    } as ExtensionAPI
+            const existing = handlers[event]
+            if (existing === undefined) {
+                handlers[event] = handler
+                return
+            }
 
-    return { pi, handlers }
+            if (Array.isArray(existing)) {
+                existing.push(handler)
+                return
+            }
+
+            handlers[event] = [existing, handler]
+        },
+        sendMessage,
+    } as unknown as ExtensionAPI
+
+    return { pi, handlers, sendMessage }
 }
 
-function getSessionStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getSessionStartHandler(handlers: HandlerRegistry) {
     return handlers.session_start as ((event: SessionStartEvent, ctx: ExtensionContext) => Promise<void>) | undefined
 }
 
-function getRuntimeHandler<TEvent>(
-    handlers: Partial<Record<string, (...args: unknown[]) => unknown>>,
-    eventName: string,
-) {
+function getRuntimeHandler<TEvent>(handlers: HandlerRegistry, eventName: string) {
     return handlers[eventName] as ((event: TEvent, ctx: ExtensionContext) => Promise<void> | undefined) | undefined
 }
 
-function getBeforeAgentStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
-    return handlers.before_agent_start as
-        | ((event: BeforeAgentStartEvent, ctx: ExtensionContext) => Promise<void> | undefined)
-        | undefined
+async function runBeforeAgentStartHandlers(
+    handlers: HandlerRegistry,
+    event: BeforeAgentStartEvent,
+    ctx: ExtensionContext,
+) {
+    const registered = handlers.before_agent_start
+    if (registered === undefined) {
+        return undefined
+    }
+
+    const handlerList = Array.isArray(registered) ? registered : [registered]
+    const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = []
+    let currentSystemPrompt = event.systemPrompt
+
+    for (const handler of handlerList) {
+        const result = (await handler(
+            {
+                ...event,
+                systemPrompt: currentSystemPrompt,
+            },
+            ctx,
+        )) as BeforeAgentStartEventResult | undefined
+
+        if (result?.message !== undefined) {
+            messages.push(result.message)
+        }
+
+        if (result?.systemPrompt !== undefined) {
+            currentSystemPrompt = result.systemPrompt
+        }
+    }
+
+    return {
+        messages,
+        systemPrompt: currentSystemPrompt,
+    }
 }
 
-function getUserBashHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getBeforeAgentStartHandler(handlers: HandlerRegistry) {
+    return async (
+        event: BeforeAgentStartEvent,
+        ctx: ExtensionContext,
+    ): Promise<BeforeAgentStartEventResult | undefined> => {
+        const aggregate = await runBeforeAgentStartHandlers(handlers, event, ctx)
+        if (aggregate === undefined) {
+            return undefined
+        }
+
+        const message = aggregate.messages.at(-1)
+        const systemPrompt = aggregate.systemPrompt === event.systemPrompt ? undefined : aggregate.systemPrompt
+        if (message === undefined && systemPrompt === undefined) {
+            return undefined
+        }
+
+        return {
+            message,
+            systemPrompt,
+        }
+    }
+}
+
+function getUserBashHandler(handlers: HandlerRegistry) {
     return handlers.user_bash as
         | ((event: UserBashEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getInputHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getInputHandler(handlers: HandlerRegistry) {
     return handlers.input as
         | ((event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult> | undefined)
         | undefined
 }
 
-function getProjectTrustHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getProjectTrustHandler(handlers: HandlerRegistry) {
     return handlers.project_trust as
         | ((event: ProjectTrustEvent, ctx: ProjectTrustContext) => Promise<ProjectTrustEventResult>)
         | undefined
 }
 
-function getResourcesDiscoverHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getResourcesDiscoverHandler(handlers: HandlerRegistry) {
     return handlers.resources_discover as
         | ((event: ResourcesDiscoverEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionBeforeSwitchHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getSessionBeforeSwitchHandler(handlers: HandlerRegistry) {
     return handlers.session_before_switch as
         | ((event: SessionBeforeSwitchEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionBeforeCompactHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getSessionBeforeCompactHandler(handlers: HandlerRegistry) {
     return handlers.session_before_compact as
         | ((event: SessionBeforeCompactEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionCompactHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getSessionCompactHandler(handlers: HandlerRegistry) {
     return handlers.session_compact as
         | ((event: SessionCompactEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getSessionShutdownHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getSessionShutdownHandler(handlers: HandlerRegistry) {
     return handlers.session_shutdown as
         | ((event: SessionShutdownEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getModelSelectHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getModelSelectHandler(handlers: HandlerRegistry) {
     return handlers.model_select as
         | ((event: ModelSelectEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getThinkingLevelSelectHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getThinkingLevelSelectHandler(handlers: HandlerRegistry) {
     return handlers.thinking_level_select as
         | ((event: ThinkingLevelSelectEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolCallHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getToolCallHandler(handlers: HandlerRegistry) {
     return handlers.tool_call as ((event: ToolCallEvent, ctx: ExtensionContext) => Promise<void>) | undefined
 }
 
-function getToolResultHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getToolResultHandler(handlers: HandlerRegistry) {
     return handlers.tool_result as
         | ((event: ToolResultEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolExecutionStartHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getToolExecutionStartHandler(handlers: HandlerRegistry) {
     return handlers.tool_execution_start as
         | ((event: ToolExecutionStartEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolExecutionUpdateHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getToolExecutionUpdateHandler(handlers: HandlerRegistry) {
     return handlers.tool_execution_update as
         | ((event: ToolExecutionUpdateEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
 }
 
-function getToolExecutionEndHandler(handlers: Partial<Record<string, (...args: unknown[]) => unknown>>) {
+function getToolExecutionEndHandler(handlers: HandlerRegistry) {
     return handlers.tool_execution_end as
         | ((event: ToolExecutionEndEvent, ctx: ExtensionContext) => Promise<void> | undefined)
         | undefined
@@ -363,6 +441,14 @@ function createStdoutHookCommand(stdout: string) {
 
 function createLatestInputTransformHookCommand(suffix: string) {
     return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);process.stdout.write(JSON.stringify({version:1,event:'input',output:{action:'transform',text:String(payload.payload.text)+process.argv[1]}}));});" ${JSON.stringify(suffix)}`
+}
+
+function createLatestBeforeAgentStartHookCommand(options: {
+    messageType: string
+    messageContent: string
+    systemPromptSuffix?: string
+}) {
+    return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);const output={message:{customType:process.argv[1],content:process.argv[2]}};if(process.argv[3])output.systemPrompt=String(payload.payload.systemPrompt)+process.argv[3];process.stdout.write(JSON.stringify({version:1,event:'before_agent_start',output}));});" ${JSON.stringify(options.messageType)} ${JSON.stringify(options.messageContent)} ${JSON.stringify(options.systemPromptSuffix ?? "")}`
 }
 
 function createLongRunningHookCommand(options: { startedPath: string; resultPath: string; completeAfterMs: number }) {
@@ -3179,6 +3265,362 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("returns before_agent_start message injection and system-prompt replacement from valid semantic stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "before_agent_start",
+                                            output: {
+                                                message: {
+                                                    customType: "pi-hooks.test",
+                                                    content: "Injected context",
+                                                    display: true,
+                                                },
+                                                systemPrompt: "You are Hook Pi.",
+                                            },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                beforeAgentStart?.(
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toEqual({
+                message: {
+                    customType: "pi-hooks.test",
+                    content: "Injected context",
+                    display: true,
+                },
+                systemPrompt: "You are Hook Pi.",
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("composes before_agent_start messages in configured order over the latest system prompt", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "before_agent_start",
+                                            output: {
+                                                message: {
+                                                    customType: "pi-hooks.first",
+                                                    content: "First message",
+                                                },
+                                                systemPrompt: "You are Pi. -> first",
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createLatestBeforeAgentStartHookCommand({
+                                        messageType: "pi-hooks.second",
+                                        messageContent: "Second message",
+                                        systemPromptSuffix: " -> second",
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers, sendMessage } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+            const ctx = createExtensionContext(canonicalProjectDir)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                runBeforeAgentStartHandlers(
+                    handlers,
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    ctx,
+                ),
+            ).resolves.toEqual({
+                messages: [
+                    {
+                        customType: "pi-hooks.first",
+                        content: "First message",
+                    },
+                    {
+                        customType: "pi-hooks.second",
+                        content: "Second message",
+                    },
+                ],
+                systemPrompt: "You are Pi. -> first -> second",
+            })
+            await expect(
+                beforeAgentStart?.(
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    ctx,
+                ),
+            ).resolves.toEqual({
+                message: {
+                    customType: "pi-hooks.second",
+                    content: "Second message",
+                },
+                systemPrompt: "You are Pi. -> first -> second",
+            })
+            expect(sendMessage).not.toHaveBeenCalled()
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("warns and ignores malformed and unsupported before_agent_start stdout without blocking valid semantic effects", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    before_agent_start: [
+                        {
+                            matcher: "hello world",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "before_agent_start",
+                                            output: {
+                                                message: {
+                                                    customType: "pi-hooks.first",
+                                                    content: "First message",
+                                                },
+                                                systemPrompt: "You are Pi. -> first",
+                                            },
+                                        }),
+                                    ),
+                                },
+                                { type: "command", command: createStdoutHookCommand("{not valid json") },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "before_agent_start",
+                                            output: {
+                                                messages: [
+                                                    {
+                                                        customType: "pi-hooks.invalid-array",
+                                                        content: "bad",
+                                                    },
+                                                ],
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "before_agent_start",
+                                            output: {
+                                                message: {
+                                                    customType: "pi-hooks.invalid-shape",
+                                                },
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "before_agent_start",
+                                            output: {
+                                                foo: true,
+                                            },
+                                        }),
+                                    ),
+                                },
+                                {
+                                    type: "command",
+                                    command: createLatestBeforeAgentStartHookCommand({
+                                        messageType: "pi-hooks.second",
+                                        messageContent: "Second message",
+                                        systemPromptSuffix: " -> second",
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers, sendMessage } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const beforeAgentStart = getBeforeAgentStartHandler(handlers)
+            const ctx = createExtensionContext(canonicalProjectDir)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            await expect(
+                runBeforeAgentStartHandlers(
+                    handlers,
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    ctx,
+                ),
+            ).resolves.toEqual({
+                messages: [
+                    {
+                        customType: "pi-hooks.first",
+                        content: "First message",
+                    },
+                    {
+                        customType: "pi-hooks.second",
+                        content: "Second message",
+                    },
+                ],
+                systemPrompt: "You are Pi. -> first -> second",
+            })
+            await expect(
+                beforeAgentStart?.(
+                    {
+                        type: "before_agent_start",
+                        prompt: "hello world",
+                        systemPrompt: "You are Pi.",
+                        systemPromptOptions: { cwd: canonicalProjectDir },
+                    },
+                    ctx,
+                ),
+            ).resolves.toEqual({
+                message: {
+                    customType: "pi-hooks.second",
+                    content: "Second message",
+                },
+                systemPrompt: "You are Pi. -> first -> second",
+            })
+            expect(sendMessage).not.toHaveBeenCalled()
+            expect(warn).toHaveBeenCalledWith(
+                expect.stringContaining("Ignoring invalid hook stdout for before_agent_start"),
+            )
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property messages"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("must have required property 'content'"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property foo"))
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("runs matching user_bash hooks with canonical payload in the active session cwd", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
@@ -3274,7 +3716,7 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("does not block or mutate before_agent_start handling", async () => {
+    it("does not mutate before_agent_start events while awaiting semantic hook handling", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const outputPath = join(projectDir, "slow-before-agent-start.json")
@@ -3326,17 +3768,16 @@ describe("pi hooks loader", () => {
                 systemPromptOptions: { cwd: canonicalProjectDir },
             }
 
-            expect(beforeAgentStart?.(event, createExtensionContext(canonicalProjectDir))).toBeUndefined()
+            await expect(
+                beforeAgentStart?.(event, createExtensionContext(canonicalProjectDir)),
+            ).resolves.toBeUndefined()
             expect(event).toEqual({
                 type: "before_agent_start",
                 prompt: "hello world",
                 systemPrompt: "You are Pi.",
                 systemPromptOptions: { cwd: canonicalProjectDir },
             })
-            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
-            await vi.waitFor(async () => {
-                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
-            })
+            await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
@@ -3456,7 +3897,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 beforeAgentStart?.(
                     {
                         type: "before_agent_start",
@@ -3466,7 +3907,7 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
+            ).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
@@ -3590,7 +4031,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 beforeAgentStart?.(
                     {
                         type: "before_agent_start",
@@ -3600,7 +4041,7 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
                 ),
-            ).toBeUndefined()
+            ).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
                 expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i))
