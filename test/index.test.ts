@@ -452,6 +452,10 @@ function createStdoutHookCommand(stdout: string) {
     return `node --input-type=module -e "process.stdout.write(process.argv[1]);" ${JSON.stringify(stdout)}`
 }
 
+function createNodeHookCommandWithStdout(outputPath: string, stdout: string) {
+    return `node --input-type=module -e "import('node:fs').then(fs=>{let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{fs.writeFileSync(process.argv[1],input);process.stdout.write(process.argv[2]);});});" ${JSON.stringify(outputPath)} ${JSON.stringify(stdout)}`
+}
+
 function createLatestInputTransformHookCommand(suffix: string) {
     return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);process.stdout.write(JSON.stringify({version:1,event:'input',output:{action:'transform',text:String(payload.payload.text)+process.argv[1]}}));});" ${JSON.stringify(suffix)}`
 }
@@ -1005,6 +1009,114 @@ describe("pi hooks loader", () => {
             await expect(readFile(skippedOutputPath, "utf8")).rejects.toThrow()
             await expect(readFile(projectLocalOutputPath, "utf8")).rejects.toThrow()
         } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("keeps project_trust observe-only when hooks emit semantic-looking stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const outputPath = join(projectDir, "project-trust-semantic-payload.json")
+        const projectLocalOutputPath = join(projectDir, "project-trust-project-local-semantic.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+
+        await writeFile(
+            join(homeDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    project_trust: [
+                        {
+                            matcher: canonicalProjectDir,
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createNodeHookCommandWithStdout(
+                                        outputPath,
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "project_trust",
+                                            output: { block: { reason: "Blocked" } },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    project_trust: [
+                        {
+                            matcher: canonicalProjectDir,
+                            hooks: [{ type: "command", command: createNodeHookCommand(projectLocalOutputPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const projectTrust = getProjectTrustHandler(handlers)
+
+            await expect(
+                projectTrust?.(
+                    {
+                        type: "project_trust",
+                        cwd: canonicalProjectDir,
+                    },
+                    createProjectTrustContext(canonicalHomeDir),
+                ),
+            ).resolves.toEqual({ trusted: "undecided" })
+
+            await vi.waitFor(async () => {
+                const payload = JSON.parse(await readFile(outputPath, "utf8")) as {
+                    event: string
+                    sourcePath: string
+                    matcher: unknown
+                    payload: { type: string; cwd: string }
+                }
+
+                expect(payload).toEqual({
+                    version: 1,
+                    event: "project_trust",
+                    sourcePath: join(canonicalHomeDir, ".pi", "hooks.json"),
+                    matcher: { kind: "exact", values: [canonicalProjectDir] },
+                    cwd: canonicalHomeDir,
+                    payload: {
+                        type: "project_trust",
+                        cwd: canonicalProjectDir,
+                    },
+                })
+            })
+
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for project_trust"),
+                )
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property block"))
+            })
+            await expect(readFile(projectLocalOutputPath, "utf8")).rejects.toThrow()
+        } finally {
+            warn.mockRestore()
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
@@ -3188,6 +3300,265 @@ describe("pi hooks loader", () => {
                     ),
                 )
             })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("keeps match-all-only lifecycle and message events observe-only when hooks emit semantic-looking stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const sessionInfoOutputPath = join(projectDir, "session-info-changed-semantic-payload.json")
+        const messageStartOutputPath = join(projectDir, "message-start-semantic-payload.json")
+        const assistantMessage = {
+            role: "assistant",
+            content: [{ type: "text", text: "done" }],
+        }
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_info_changed: [
+                        {
+                            matcher: "named-session-only",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createNodeHookCommandWithStdout(
+                                        sessionInfoOutputPath,
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "session_info_changed",
+                                            output: { systemPrompt: "Override" },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                    message_start: [
+                        {
+                            matcher: "assistant-only",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createNodeHookCommandWithStdout(
+                                        messageStartOutputPath,
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "message_start",
+                                            output: { input: {} },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            await getSessionStartHandler(handlers)?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            expect(
+                getRuntimeHandler<SessionInfoChangedEvent>(handlers, "session_info_changed")?.(
+                    { type: "session_info_changed", name: "renamed-session" },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+            expect(
+                getRuntimeHandler<MessageStartEvent>(handlers, "message_start")?.(
+                    { type: "message_start", message: assistantMessage },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                const sessionInfoPayload = JSON.parse(await readFile(sessionInfoOutputPath, "utf8")) as {
+                    matcher: unknown
+                }
+                const messageStartPayload = JSON.parse(await readFile(messageStartOutputPath, "utf8")) as {
+                    matcher: unknown
+                }
+
+                expect(sessionInfoPayload.matcher).toEqual({ kind: "all" })
+                expect(messageStartPayload.matcher).toEqual({ kind: "all" })
+            })
+
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring matcher in hooks.json"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("session_info_changed"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("named-session-only"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("message_start"))
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("assistant-only"))
+                expect(warn).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for session_info_changed"),
+                )
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property systemPrompt"))
+                expect(warn).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for message_start"),
+                )
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property input"))
+            })
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("keeps matcher-capable observe-only lifecycle and selection events non-semantic under structured stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const sessionStartOutputPath = join(projectDir, "session-start-semantic-payload.json")
+        const sessionStartSkippedPath = join(projectDir, "session-start-semantic-skipped.json")
+        const modelSelectOutputPath = join(projectDir, "model-select-semantic-payload.json")
+        const modelSelectSkippedPath = join(projectDir, "model-select-semantic-skipped.json")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            matcher: "startup",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createNodeHookCommandWithStdout(
+                                        sessionStartOutputPath,
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "session_start",
+                                            output: { content: [{ type: "text", text: "patched" }] },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                        {
+                            matcher: "resume",
+                            hooks: [{ type: "command", command: createNodeHookCommand(sessionStartSkippedPath) }],
+                        },
+                    ],
+                    model_select: [
+                        {
+                            matcher: "cycle",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createNodeHookCommandWithStdout(
+                                        modelSelectOutputPath,
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "model_select",
+                                            output: { block: { reason: "Blocked" } },
+                                        }),
+                                    ),
+                                },
+                            ],
+                        },
+                        {
+                            matcher: "restore",
+                            hooks: [{ type: "command", command: createNodeHookCommand(modelSelectSkippedPath) }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const modelSelect = getModelSelectHandler(handlers)
+
+            await expect(
+                sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).resolves.toBeUndefined()
+
+            expect(modelSelect).toBeTypeOf("function")
+            expect(
+                modelSelect?.(
+                    {
+                        type: "model_select",
+                        source: "cycle",
+                        model: {
+                            id: "gpt-5",
+                            provider: "openai",
+                        },
+                        previousModel: {
+                            id: "gpt-4.1",
+                            provider: "openai",
+                        },
+                    },
+                    createExtensionContext(canonicalProjectDir),
+                ),
+            ).toBeUndefined()
+
+            await vi.waitFor(async () => {
+                const sessionStartPayload = JSON.parse(await readFile(sessionStartOutputPath, "utf8")) as {
+                    matcher: unknown
+                    payload: { reason: string }
+                }
+                const modelSelectPayload = JSON.parse(await readFile(modelSelectOutputPath, "utf8")) as {
+                    matcher: unknown
+                    payload: { source: string }
+                }
+
+                expect(sessionStartPayload.matcher).toEqual({ kind: "exact", values: ["startup"] })
+                expect(sessionStartPayload.payload.reason).toBe("startup")
+                expect(modelSelectPayload.matcher).toEqual({ kind: "exact", values: ["cycle"] })
+                expect(modelSelectPayload.payload.source).toBe("cycle")
+            })
+
+            await vi.waitFor(() => {
+                expect(warn).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for session_start"),
+                )
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property content"))
+                expect(warn).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for model_select"),
+                )
+                expect(warn).toHaveBeenCalledWith(expect.stringContaining("unknown property block"))
+            })
+
+            await expect(readFile(sessionStartSkippedPath, "utf8")).rejects.toThrow()
+            await expect(readFile(modelSelectSkippedPath, "utf8")).rejects.toThrow()
         } finally {
             warn.mockRestore()
             process.env.HOME = previousHome
