@@ -49,6 +49,11 @@ type BeforeAgentStartEventResult = {
     systemPrompt?: string
 }
 
+type ToolCallEventResult = {
+    block?: boolean
+    reason?: string
+}
+
 type RegisteredHandler = (...args: unknown[]) => unknown
 type HandlerRegistry = Partial<Record<string, RegisteredHandler | RegisteredHandler[]>>
 
@@ -400,7 +405,9 @@ function getThinkingLevelSelectHandler(handlers: HandlerRegistry) {
 }
 
 function getToolCallHandler(handlers: HandlerRegistry) {
-    return handlers.tool_call as ((event: ToolCallEvent, ctx: ExtensionContext) => Promise<void>) | undefined
+    return handlers.tool_call as
+        | ((event: ToolCallEvent, ctx: ExtensionContext) => Promise<ToolCallEventResult | undefined>)
+        | undefined
 }
 
 function getToolResultHandler(handlers: HandlerRegistry) {
@@ -449,6 +456,14 @@ function createLatestBeforeAgentStartHookCommand(options: {
     systemPromptSuffix?: string
 }) {
     return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);const output={message:{customType:process.argv[1],content:process.argv[2]}};if(process.argv[3])output.systemPrompt=String(payload.payload.systemPrompt)+process.argv[3];process.stdout.write(JSON.stringify({version:1,event:'before_agent_start',output}));});" ${JSON.stringify(options.messageType)} ${JSON.stringify(options.messageContent)} ${JSON.stringify(options.systemPromptSuffix ?? "")}`
+}
+
+function createLatestToolCallInputHookCommand(suffix: string) {
+    return `node --input-type=module -e "let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const payload=JSON.parse(input);process.stdout.write(JSON.stringify({version:1,event:'tool_call',output:{input:{step:String(payload.payload.input.step)+process.argv[1]}}}));});" ${JSON.stringify(suffix)}`
+}
+
+function createLatestToolCallBlockHookCommand(reason: string) {
+    return `node --input-type=module -e "process.stdout.write(JSON.stringify({version:1,event:'tool_call',output:{block:{reason:process.argv[1]}}}));" ${JSON.stringify(reason)}`
 }
 
 function createLongRunningHookCommand(options: { startedPath: string; resultPath: string; completeAfterMs: number }) {
@@ -2422,17 +2437,15 @@ describe("pi hooks loader", () => {
 
             expect(toolCall).toBeTypeOf("function")
 
-            expect(
-                toolCall?.(
-                    {
-                        type: "tool_call",
-                        toolCallId: "call-1",
-                        toolName: "read",
-                        input: { path: "README.md" },
-                    },
-                    createExtensionContext(canonicalProjectDir, { signal: controller.signal }),
-                ),
-            ).toBeUndefined()
+            const toolCallPromise = toolCall?.(
+                {
+                    type: "tool_call",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    input: { path: "README.md" },
+                },
+                createExtensionContext(canonicalProjectDir, { signal: controller.signal }),
+            )
 
             await vi.waitFor(async () => {
                 await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
@@ -2443,6 +2456,7 @@ describe("pi hooks loader", () => {
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
             })
+            await expect(toolCallPromise).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command aborted"))
             })
@@ -2506,17 +2520,15 @@ describe("pi hooks loader", () => {
             expect(toolCall).toBeTypeOf("function")
             expect(sessionShutdown).toBeTypeOf("function")
 
-            expect(
-                toolCall?.(
-                    {
-                        type: "tool_call",
-                        toolCallId: "call-1",
-                        toolName: "read",
-                        input: { path: "README.md" },
-                    },
-                    createExtensionContext(canonicalProjectDir),
-                ),
-            ).toBeUndefined()
+            const toolCallPromise = toolCall?.(
+                {
+                    type: "tool_call",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    input: { path: "README.md" },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
 
             await vi.waitFor(async () => {
                 await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
@@ -2537,6 +2549,7 @@ describe("pi hooks loader", () => {
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
             })
+            await expect(toolCallPromise).resolves.toBeUndefined()
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
@@ -2596,17 +2609,15 @@ describe("pi hooks loader", () => {
 
             expect(toolCall).toBeTypeOf("function")
 
-            expect(
-                toolCall?.(
-                    {
-                        type: "tool_call",
-                        toolCallId: "call-1",
-                        toolName: "read",
-                        input: { path: "README.md" },
-                    },
-                    createExtensionContext(canonicalProjectDir),
-                ),
-            ).toBeUndefined()
+            const toolCallPromise = toolCall?.(
+                {
+                    type: "tool_call",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    input: { path: "README.md" },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
 
             await vi.waitFor(async () => {
                 await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
@@ -2614,6 +2625,7 @@ describe("pi hooks loader", () => {
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
             })
+            await expect(toolCallPromise).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out after 0.05s"))
             })
@@ -2674,17 +2686,15 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
-                toolCall?.(
-                    {
-                        type: "tool_call",
-                        toolCallId: "call-1",
-                        toolName: "read",
-                        input: { path: "README.md" },
-                    },
-                    createExtensionContext(canonicalProjectDir),
-                ),
-            ).toBeUndefined()
+            const toolCallPromise = toolCall?.(
+                {
+                    type: "tool_call",
+                    toolCallId: "call-1",
+                    toolName: "read",
+                    input: { path: "README.md" },
+                },
+                createExtensionContext(canonicalProjectDir),
+            )
 
             await vi.waitFor(async () => {
                 await expect(readFile(startedPath, "utf8")).resolves.toBe("started")
@@ -2704,6 +2714,7 @@ describe("pi hooks loader", () => {
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("terminated")
             })
+            await expect(toolCallPromise).resolves.toBeUndefined()
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
@@ -4643,6 +4654,194 @@ describe("pi hooks loader", () => {
         }
     })
 
+    it("returns transformed tool input from valid semantic stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                { type: "command", command: createLatestToolCallInputHookCommand(" + transformed") },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: ToolCallEvent = {
+                type: "tool_call",
+                toolCallId: "call-1",
+                toolName: "custom-tool",
+                input: { step: "draft" },
+            }
+
+            await expect(toolCall?.(event, createExtensionContext(canonicalProjectDir))).resolves.toBeUndefined()
+            expect(event.input).toEqual({ step: "draft + transformed" })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("composes multiple valid tool_call input replacements in configured order over the latest state", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                { type: "command", command: createLatestToolCallInputHookCommand(" + first") },
+                                { type: "command", command: createLatestToolCallInputHookCommand(" + second") },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: ToolCallEvent = {
+                type: "tool_call",
+                toolCallId: "call-1",
+                toolName: "custom-tool",
+                input: { step: "draft" },
+            }
+
+            await expect(toolCall?.(event, createExtensionContext(canonicalProjectDir))).resolves.toBeUndefined()
+            expect(event.input).toEqual({ step: "draft + first + second" })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("stops tool_call semantic processing at the first valid block while warning on malformed and unsupported stdout", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+        const afterBlockPath = join(projectDir, "tool-call-after-block.json")
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    tool_call: [
+                        {
+                            matcher: "custom-tool",
+                            hooks: [
+                                { type: "command", command: createStdoutHookCommand("{not valid json") },
+                                {
+                                    type: "command",
+                                    command: createStdoutHookCommand(
+                                        JSON.stringify({
+                                            version: 1,
+                                            event: "tool_call",
+                                            output: { input: { step: "ignored" }, block: { reason: "bad" } },
+                                        }),
+                                    ),
+                                },
+                                { type: "command", command: createLatestToolCallBlockHookCommand("Blocked by hooks") },
+                                { type: "command", command: createNodeHookCommand(afterBlockPath) },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalHomeDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+
+            const sessionStart = getSessionStartHandler(handlers)
+            const toolCall = getToolCallHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir),
+            )
+
+            const event: ToolCallEvent = {
+                type: "tool_call",
+                toolCallId: "call-1",
+                toolName: "custom-tool",
+                input: { step: "draft" },
+            }
+
+            await expect(toolCall?.(event, createExtensionContext(canonicalProjectDir))).resolves.toEqual({
+                block: true,
+                reason: "Blocked by hooks",
+            })
+            expect(event.input).toEqual({ step: "draft" })
+            await expect(readFile(afterBlockPath, "utf8")).rejects.toThrow()
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Ignoring invalid hook stdout for tool_call"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("not valid json"))
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("must match a schema in anyOf"))
+        } finally {
+            warn.mockRestore()
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
     it("runs matching tool_call hooks with canonical payload in the active session cwd", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
@@ -4835,7 +5034,7 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("does not block tool_call on hook completion", async () => {
+    it("waits for tool_call semantic hooks before returning", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const outputPath = join(projectDir, "slow-tool-call.json")
@@ -4880,7 +5079,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 toolCall?.(
                     {
                         type: "tool_call",
@@ -4890,18 +5089,15 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
-            await expect(readFile(outputPath, "utf8")).rejects.toThrow()
-            await vi.waitFor(async () => {
-                await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
-            })
+            ).resolves.toBeUndefined()
+            await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
     })
 
-    it("reports non-zero tool_call hook exits without crashing tool execution", async () => {
+    it("reports non-zero tool_call hook exits without blocking tool execution", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
 
@@ -4945,7 +5141,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 toolCall?.(
                     {
                         type: "tool_call",
@@ -4955,7 +5151,7 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
+            ).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("exit code 7"))
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("hook-out"))
@@ -5195,7 +5391,7 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("reports timed out tool_call hooks without crashing tool execution", async () => {
+    it("reports timed out tool_call hooks without blocking tool execution", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
 
@@ -5240,7 +5436,7 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir),
             )
 
-            expect(
+            await expect(
                 toolCall?.(
                     {
                         type: "tool_call",
@@ -5250,7 +5446,7 @@ describe("pi hooks loader", () => {
                     },
                     createExtensionContext(canonicalProjectDir),
                 ),
-            ).toBeUndefined()
+            ).resolves.toBeUndefined()
             await vi.waitFor(() => {
                 expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out"))
             })

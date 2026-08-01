@@ -13,6 +13,7 @@ import type {
     InputEventResult,
     SessionStartEvent,
     ToolCallEvent,
+    ToolCallEventResult,
     ToolResultEvent,
 } from "@earendil-works/pi-coding-agent"
 
@@ -345,6 +346,14 @@ type InputHookResult =
 
 type BeforeAgentStartHookResult = BeforeAgentStartEventResult
 
+type ToolCallHookResult =
+    | { input: JsonObject }
+    | {
+          block: {
+              reason?: string
+          }
+      }
+
 type BeforeAgentStartHookSlot = {
     sourcePath: string
     matcher: LoadedMatcher
@@ -414,6 +423,34 @@ const beforeAgentStartHookOutputSchema = {
         systemPrompt: { type: "string" },
     },
     anyOf: [{ required: ["message"] }, { required: ["systemPrompt"] }],
+} as const
+const toolCallHookOutputSchema = {
+    anyOf: [
+        {
+            type: "object",
+            required: ["input"],
+            additionalProperties: false,
+            properties: {
+                input: {
+                    type: "object",
+                },
+            },
+        },
+        {
+            type: "object",
+            required: ["block"],
+            additionalProperties: false,
+            properties: {
+                block: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                        reason: { type: "string" },
+                    },
+                },
+            },
+        },
+    ],
 } as const
 const hookStdoutEnvelopeSchema = {
     type: "object",
@@ -637,9 +674,12 @@ export default function setup(pi: ExtensionAPI) {
         dispatchUserBashHooks(event, ctx)
     })
 
-    pi.on("tool_call", (event: ToolCallEvent, ctx: ExtensionContext) => {
-        dispatchToolCallHooks(event, ctx)
-    })
+    pi.on(
+        "tool_call",
+        async (event: ToolCallEvent, ctx: ExtensionContext): Promise<ToolCallEventResult | undefined> => {
+            return dispatchToolCallHooks(event, ctx)
+        },
+    )
 
     pi.on("tool_result", (event: ToolResultEvent, ctx: ExtensionContext) => {
         dispatchToolResultHooks(event, ctx)
@@ -756,6 +796,10 @@ function getHookStdoutOutputSchema(eventName: string) {
 
     if (eventName === "before_agent_start") {
         return beforeAgentStartHookOutputSchema
+    }
+
+    if (eventName === "tool_call") {
+        return toolCallHookOutputSchema
     }
 
     if (SEMANTIC_STDOUT_EVENT_NAMES.has(eventName)) {
@@ -1477,8 +1521,71 @@ function dispatchTextMatchedHooks(options: {
     }
 }
 
-function dispatchToolCallHooks(event: ToolCallEvent, ctx: ExtensionContext) {
-    dispatchToolNamedHooks("tool_call", event, ctx)
+async function dispatchToolCallHooks(
+    event: ToolCallEvent,
+    ctx: ExtensionContext,
+): Promise<ToolCallEventResult | undefined> {
+    let currentInput = serializeJsonObject(event.input)
+
+    for (const file of activeRegistry.files) {
+        for (const registration of file.events) {
+            if (registration.eventName !== "tool_call") {
+                continue
+            }
+
+            for (const matcherGroup of registration.matcherGroups) {
+                if (!matchesLoadedMatcher(matcherGroup.normalizedMatcher, event.toolName)) {
+                    continue
+                }
+
+                for (const hook of matcherGroup.hooks) {
+                    let stdoutEnvelope: HookStdoutEnvelope | undefined
+
+                    try {
+                        stdoutEnvelope = await runCommandHook({
+                            hook,
+                            cwd: ctx.cwd,
+                            payload: createHookStdinEnvelope({
+                                eventName: registration.eventName,
+                                sourcePath: file.sourcePath,
+                                matcher: matcherGroup.normalizedMatcher,
+                                cwd: ctx.cwd,
+                                event: {
+                                    ...event,
+                                    input: currentInput,
+                                },
+                            }),
+                            reportFailures: true,
+                            abortSignal: getHookAbortSignal(event, ctx),
+                            consumeStdout: true,
+                        })
+                    } catch (error) {
+                        console.warn(
+                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
+                        )
+                        continue
+                    }
+
+                    if (stdoutEnvelope === undefined) {
+                        continue
+                    }
+
+                    const output = stdoutEnvelope.output as ToolCallHookResult
+                    if ("block" in output) {
+                        return {
+                            block: true,
+                            ...(output.block.reason === undefined ? {} : { reason: output.block.reason }),
+                        }
+                    }
+
+                    currentInput = output.input
+                }
+            }
+        }
+    }
+
+    replaceObjectContents(event.input as Record<string, unknown>, currentInput)
+    return undefined
 }
 
 function dispatchToolResultHooks(event: ToolResultEvent, ctx: ExtensionContext) {
@@ -1534,6 +1641,14 @@ function dispatchToolNamedHooks(
             }
         }
     }
+}
+
+function replaceObjectContents(target: Record<string, unknown>, replacement: JsonObject) {
+    for (const key of Object.keys(target)) {
+        delete target[key]
+    }
+
+    Object.assign(target, replacement)
 }
 
 function matchesLoadedMatcher(matcher: LoadedMatcher, value: string) {
