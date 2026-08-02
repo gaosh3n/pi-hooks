@@ -424,3 +424,149 @@ Additional details from `schema.rs` and `output_parser.rs`:
 - invalid output is contained at the hook boundary rather than silently reinterpreted into some other effect
 
 This is a useful Pi Hooks reference point: syntax validation and event-policy validation are separate concerns, even when both happen on stdout.
+
+## Codex operational loop: how hook execution is surfaced and managed
+
+Additional sources inspected for this section:
+
+- `https://developers.openai.com/codex/hooks`
+- `<root-directory>/codex-rs/hooks/src/engine/dispatcher.rs`
+- `<root-directory>/codex-rs/hooks/src/engine/output_parser.rs`
+- `<root-directory>/codex-rs/hooks/src/events/session_start.rs`
+- `<root-directory>/codex-rs/hooks/src/events/pre_tool_use.rs`
+- `<root-directory>/codex-rs/hooks/src/events/post_tool_use.rs`
+- `<root-directory>/codex-rs/hooks/src/events/stop.rs`
+- `<root-directory>/codex-rs/core/src/hook_runtime.rs`
+
+### Codex models hook execution as first-class runtime data
+
+Codex does not treat hook subprocesses as invisible implementation details. The runtime and protocol exchange structured hook run records with lifecycle events.
+
+`hook_runtime.rs` imports and emits:
+
+- `HookStartedEvent`
+- `HookCompletedEvent`
+- `HookRunStatus`
+
+The runtime sends those through the session event stream at each hook seam via helpers such as:
+
+- `emit_hook_started_events(...)`
+- `emit_hook_completed_events(...)`
+
+The status enum used by completed runs is:
+
+- `running`
+- `completed`
+- `failed`
+- `blocked`
+- `stopped`
+
+Important implication: Codex has a dedicated operational plane for hooks, separate from stderr text or semantic host effects.
+
+### Codex previews hook runs before execution
+
+Before the runtime actually executes selected hooks, it computes preview runs and emits started events for them.
+
+Examples in `hook_runtime.rs`:
+
+- `run_pre_tool_use_hooks()` calls `hooks.preview_pre_tool_use(...)` then `emit_hook_started_events(...)`
+- `run_pending_session_start_hooks()` uses `run_context_injecting_hook(...)`, which also emits preview-based started events
+- `run_turn_stop_hooks()` calls `hooks.preview_stop(...)` before execution
+
+This gives the TUI/protocol deterministic metadata for “which hooks are now running” before completion results exist.
+
+### Each run summary carries config and display metadata
+
+`dispatcher.rs` builds run summaries that include more than success/failure state. The preview/completed summaries carry fields such as:
+
+- event name
+- handler type
+- execution mode
+- scope/source layer
+- source path
+- configured display order
+- final status
+- optional `status_message`
+
+This aligns with the public docs, which present `statusMessage` as a config field on handlers, not as subprocess stdout.
+
+Important implication: user-facing progress labels come from trusted config, while stdout remains the machine-readable hook control channel.
+
+### Codex executes concurrently, then normalizes completion order
+
+`dispatcher.rs` uses `FuturesUnordered` to execute selected hooks concurrently, but then sorts the results back into configured order with `completed.sort_by_key(...)` before host interpretation.
+
+So Codex deliberately separates:
+
+- wall-clock completion order
+- semantic/reporting order
+
+That is a strong reference point for Pi Hooks because issues `#16`-`#22` already require deterministic configured-order semantic composition.
+
+### Completion entries are typed, not just free-form warnings
+
+The event-specific parsers (`session_start.rs`, `pre_tool_use.rs`, `post_tool_use.rs`, `stop.rs`) accumulate `HookOutputEntry` values describing what happened during a hook run.
+
+From those files we can see Codex records entry text for things like:
+
+- runtime/process errors
+- surfaced `systemMessage`
+- stop reasons
+- block/feedback reasons
+- extra context accepted from hook output
+
+The result is that a hook run has both:
+
+- a coarse final status (`completed` / `failed` / `blocked` / `stopped`)
+- a fine-grained typed entry log explaining why
+
+### Semantic effects and reporting are intentionally separate
+
+Codex hook output parsing does not collapse “what happened operationally” into “what effect the hook had on host state.”
+
+Examples:
+
+- `PreToolUse` can yield `updated_input`, but the run still separately records status and entries
+- `SessionStart` and related events can contribute `additionalContext`, while the run record still carries its own completion event
+- `systemMessage` is surfaced as a visible entry rather than silently discarded
+- invalid or unsupported output marks the run as failed and reports the reason, while the host often continues fail-open for that seam
+
+This separation is the main operational-loop lesson for Pi Hooks: stdout semantics and run reporting should not be the same thing.
+
+### `statusMessage` is part of the operator experience
+
+The public Codex hooks docs show `statusMessage` examples such as:
+
+- `Loading session notes`
+- `Checking Bash command`
+- `Reviewing Bash output`
+
+The same field is present in Codex config/runtime structures (`hook_config.rs`, `dispatcher.rs`).
+
+So Codex has an explicit concept of operator-visible per-hook progress text. It is not inferred from stderr, and it is not coupled to semantic JSON output.
+
+### Hook events also feed telemetry/metrics
+
+`hook_runtime.rs` does more than notify the TUI/protocol. Completed events also feed:
+
+- duration metrics via `emit_hook_completed_metrics(...)`
+- analytics via `track_hook_completed_analytics(...)`
+
+Those payloads include status/source information derived from the same hook run summaries.
+
+Important implication: one structured run model powers UI, debugging, and analytics.
+
+### Codex’s operational loop is richer than its semantic loop
+
+Taken together, Codex’s design is:
+
+- preview selected hooks
+- emit started events
+- execute hooks
+- classify outcomes into structured statuses
+- attach typed output entries
+- emit completed events
+- separately apply host-side semantic effects
+- separately record metrics/analytics
+
+For Pi Hooks, the key lesson is not “copy Codex’s exact stdout fields.” The deeper lesson is that hooks are treated as a first-class observable runtime, not just subprocesses that occasionally mutate host state.
