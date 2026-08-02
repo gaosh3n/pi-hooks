@@ -374,7 +374,20 @@ type ActiveHookExecution = {
     clearAbortListener: (() => void) | undefined
 }
 
+type HookStatusSink = {
+    setStatus(key: string, text: string | undefined): void
+}
+
+type HookRunRecord = {
+    id: string
+    eventName: string
+    statusMessage: string | undefined
+    startedAt: number
+    displayOrder: number
+}
+
 const HOOK_PROTOCOL_VERSION = 1 as const
+const HOOK_STATUS_KEY = "pi-hooks"
 const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
 const emptyHookOutputSchema = {
     type: "object",
@@ -518,6 +531,9 @@ const EMPTY_REGISTRY: HookRegistry = { files: [] }
 let activeRegistry: HookRegistry = EMPTY_REGISTRY
 let activeBeforeAgentStartSlots: BeforeAgentStartHookSlot[] = []
 let activeHookExecutions = new Set<ActiveHookExecution>()
+let activeHookRuns = new Map<string, HookRunRecord>()
+let nextHookRunDisplayOrder = 0
+let lastHookStatusSink: HookStatusSink | undefined
 
 const hooksSchema = loadHooksSchema()
 const validateHooksSchema = compileJsonSchemaValidator(hooksSchema)
@@ -713,6 +729,10 @@ export default function setup(pi: ExtensionAPI) {
         activeRegistry = EMPTY_REGISTRY
         activeBeforeAgentStartSlots = []
         cancelActiveHookExecutions("shutdown")
+        activeHookRuns.clear()
+        renderHookStatus()
+        lastHookStatusSink = undefined
+        nextHookRunDisplayOrder = 0
         dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
     })
 
@@ -1058,6 +1078,82 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
     dispatchReasonMatchedHooks("session_start", event, ctx)
 }
 
+function getHookStatusSink(value: unknown): HookStatusSink | undefined {
+    if (typeof value !== "object" || value === null || !("setStatus" in value)) {
+        return undefined
+    }
+
+    return typeof value.setStatus === "function" ? (value as HookStatusSink) : undefined
+}
+
+function startHookRun(options: { eventName: string; statusMessage: string | undefined; statusUi?: unknown }) {
+    const statusSink = getHookStatusSink(options.statusUi)
+    if (statusSink !== undefined) {
+        lastHookStatusSink = statusSink
+    }
+
+    const displayOrder = nextHookRunDisplayOrder
+    nextHookRunDisplayOrder += 1
+
+    const run: HookRunRecord = {
+        id: `hook-run-${displayOrder}`,
+        eventName: options.eventName,
+        statusMessage: options.statusMessage,
+        startedAt: Date.now(),
+        displayOrder,
+    }
+
+    activeHookRuns.set(run.id, run)
+    renderHookStatus()
+    return run.id
+}
+
+function finishHookRun(runId: string) {
+    if (!activeHookRuns.delete(runId)) {
+        return
+    }
+
+    renderHookStatus()
+}
+
+function renderHookStatus() {
+    if (lastHookStatusSink === undefined) {
+        return
+    }
+
+    const activeRuns = [...activeHookRuns.values()].sort((left, right) => {
+        if (left.startedAt !== right.startedAt) {
+            return left.startedAt - right.startedAt
+        }
+
+        if (left.displayOrder !== right.displayOrder) {
+            return left.displayOrder - right.displayOrder
+        }
+
+        return left.id.localeCompare(right.id)
+    })
+
+    if (activeRuns.length === 0) {
+        lastHookStatusSink.setStatus(HOOK_STATUS_KEY, undefined)
+        return
+    }
+
+    if (activeRuns.length === 1) {
+        lastHookStatusSink.setStatus(HOOK_STATUS_KEY, getHookRunStatusLabel(activeRuns[0]))
+        return
+    }
+
+    const leadRun = activeRuns[0]
+    lastHookStatusSink.setStatus(
+        HOOK_STATUS_KEY,
+        `Running ${activeRuns.length} hooks: ${getHookRunStatusLabel(leadRun)} (+${activeRuns.length - 1} more)`,
+    )
+}
+
+function getHookRunStatusLabel(run: HookRunRecord) {
+    return run.statusMessage ?? `Running ${run.eventName} hook`
+}
+
 function cancelActiveHookExecutions(reason: HookCancellationReason) {
     const executions = [...activeHookExecutions]
     activeHookExecutions = new Set()
@@ -1171,6 +1267,7 @@ function dispatchProjectTrustHooks(event: ProjectTrustEvent, ctx: ProjectTrustCo
                             cwd: ctx.cwd,
                             event,
                         }),
+                        statusUi: ctx.ui,
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -1206,6 +1303,7 @@ function dispatchModelSelectHooks(event: ModelSelectEvent, ctx: ExtensionContext
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
+                        statusUi: ctx.ui,
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -1241,6 +1339,7 @@ function dispatchThinkingLevelSelectHooks(event: ThinkingLevelSelectEvent, ctx: 
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
+                        statusUi: ctx.ui,
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -1369,6 +1468,7 @@ function dispatchReasonMatchedHooks(
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
+                        statusUi: ctx.ui,
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -1404,6 +1504,7 @@ function dispatchMatchAllHooks(
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
+                        statusUi: ctx.ui,
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -1445,6 +1546,7 @@ async function dispatchBeforeAgentStartHookSlot(
             reportFailures: true,
             abortSignal: getHookAbortSignal(event, ctx),
             consumeStdout: true,
+            statusUi: ctx.ui,
         })
     } catch (error) {
         console.warn(`Hook command failed before completion: ${slot.hook.command} (${toErrorMessage(error)})`)
@@ -1499,6 +1601,7 @@ async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Pro
                             reportFailures: true,
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
+                            statusUi: ctx.ui,
                         })
                     } catch (error) {
                         console.warn(
@@ -1571,6 +1674,7 @@ function dispatchTextMatchedHooks(options: {
                         }),
                         reportFailures: options.reportFailures,
                         abortSignal: getHookAbortSignal(options.event, options.ctx),
+                        statusUi: options.ctx.ui,
                     }).catch((error: unknown) => {
                         if (!options.reportFailures) {
                             return
@@ -1623,6 +1727,7 @@ async function dispatchToolCallHooks(
                             reportFailures: true,
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
+                            statusUi: ctx.ui,
                         })
                     } catch (error) {
                         console.warn(
@@ -1694,6 +1799,7 @@ async function dispatchToolResultHooks(
                             reportFailures: true,
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
+                            statusUi: ctx.ui,
                         })
                     } catch (error) {
                         console.warn(
@@ -1777,6 +1883,7 @@ function dispatchToolNamedHooks(
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
+                        statusUi: ctx.ui,
                     }).catch((error: unknown) => {
                         console.warn(
                             `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
@@ -1828,7 +1935,13 @@ async function runCommandHook(options: {
     reportFailures?: boolean
     abortSignal?: AbortSignal
     consumeStdout?: boolean
+    statusUi?: unknown
 }): Promise<HookStdoutEnvelope | undefined> {
+    const hookRunId = startHookRun({
+        eventName: options.payload.event,
+        statusMessage: options.hook.statusMessage,
+        statusUi: options.statusUi,
+    })
     const child = spawn(options.hook.command, {
         cwd: options.cwd,
         env: process.env,
@@ -1869,98 +1982,102 @@ async function runCommandHook(options: {
         }
     }
 
-    if (options.abortSignal !== undefined) {
-        const abortHook = () => {
-            if (activeExecution.cancellationReason !== undefined) {
-                return
+    try {
+        if (options.abortSignal !== undefined) {
+            const abortHook = () => {
+                if (activeExecution.cancellationReason !== undefined) {
+                    return
+                }
+
+                activeExecution.cancellationReason = "abort"
+                child.kill()
             }
 
-            activeExecution.cancellationReason = "abort"
-            child.kill()
-        }
-
-        if (options.abortSignal.aborted) {
-            abortHook()
-        } else {
-            options.abortSignal.addEventListener("abort", abortHook, { once: true })
-            activeExecution.clearAbortListener = () => {
-                options.abortSignal?.removeEventListener("abort", abortHook)
+            if (options.abortSignal.aborted) {
+                abortHook()
+            } else {
+                options.abortSignal.addEventListener("abort", abortHook, { once: true })
+                activeExecution.clearAbortListener = () => {
+                    options.abortSignal?.removeEventListener("abort", abortHook)
+                }
             }
         }
-    }
 
-    child.stdout.on("data", (chunk: Uint8Array) => {
-        stdoutChunks.push(chunk)
-    })
-    child.stderr.on("data", (chunk: Uint8Array) => {
-        stderrChunks.push(chunk)
-    })
-
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-        child.on("error", (error) => {
-            clearExecution()
-            reject(error)
+        child.stdout.on("data", (chunk: Uint8Array) => {
+            stdoutChunks.push(chunk)
         })
-        child.stdin.on("error", (error) => {
-            clearExecution()
-            reject(error)
-        })
-        child.on("close", (code) => {
-            clearExecution()
-            resolve(code)
+        child.stderr.on("data", (chunk: Uint8Array) => {
+            stderrChunks.push(chunk)
         })
 
-        child.stdin.end(JSON.stringify(options.payload))
-    })
+        const exitCode = await new Promise<number | null>((resolve, reject) => {
+            child.on("error", (error) => {
+                clearExecution()
+                reject(error)
+            })
+            child.stdin.on("error", (error) => {
+                clearExecution()
+                reject(error)
+            })
+            child.on("close", (code) => {
+                clearExecution()
+                resolve(code)
+            })
 
-    const stdout = Buffer.concat(stdoutChunks).toString("utf8")
-    const stderr = Buffer.concat(stderrChunks).toString("utf8")
+            child.stdin.end(JSON.stringify(options.payload))
+        })
 
-    if (activeExecution.cancellationReason === "timeout") {
-        if (reportFailures) {
-            console.warn(
-                `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
-            )
-        }
-        return
-    }
+        const stdout = Buffer.concat(stdoutChunks).toString("utf8")
+        const stderr = Buffer.concat(stderrChunks).toString("utf8")
 
-    if (activeExecution.cancellationReason === "abort") {
-        if (reportFailures) {
-            console.warn(`Hook command aborted: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`)
-        }
-        return
-    }
-
-    if (activeExecution.cancellationReason === "shutdown") {
-        return
-    }
-
-    if (exitCode === 0) {
-        const parsedStdout = parseHookStdout({ stdout, eventName: options.payload.event })
-        if (parsedStdout.kind === "invalid") {
-            console.warn(`${parsedStdout.warning}\nstdout: ${stdout}\nstderr: ${stderr}`)
+        if (activeExecution.cancellationReason === "timeout") {
+            if (reportFailures) {
+                console.warn(
+                    `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
+                )
+            }
             return
         }
 
-        if (parsedStdout.kind === "valid") {
-            if (options.consumeStdout) {
+        if (activeExecution.cancellationReason === "abort") {
+            if (reportFailures) {
+                console.warn(`Hook command aborted: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`)
+            }
+            return
+        }
+
+        if (activeExecution.cancellationReason === "shutdown") {
+            return
+        }
+
+        if (exitCode === 0) {
+            const parsedStdout = parseHookStdout({ stdout, eventName: options.payload.event })
+            if (parsedStdout.kind === "invalid") {
+                console.warn(`${parsedStdout.warning}\nstdout: ${stdout}\nstderr: ${stderr}`)
+                return
+            }
+
+            if (parsedStdout.kind === "valid") {
+                if (options.consumeStdout) {
+                    return parsedStdout.envelope
+                }
+
+                console.warn(
+                    `Ignoring hook stdout for ${options.payload.event}: semantic output is not supported yet\nstdout: ${stdout}\nstderr: ${stderr}`,
+                )
                 return parsedStdout.envelope
             }
 
-            console.warn(
-                `Ignoring hook stdout for ${options.payload.event}: semantic output is not supported yet\nstdout: ${stdout}\nstderr: ${stderr}`,
-            )
-            return parsedStdout.envelope
+            return
         }
 
-        return
-    }
-
-    if (reportFailures) {
-        console.warn(
-            `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
-        )
+        if (reportFailures) {
+            console.warn(
+                `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
+            )
+        }
+    } finally {
+        finishHookRun(hookRunId)
     }
 }
 
