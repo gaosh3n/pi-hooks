@@ -570,3 +570,81 @@ Taken together, Codex’s design is:
 - separately record metrics/analytics
 
 For Pi Hooks, the key lesson is not “copy Codex’s exact stdout fields.” The deeper lesson is that hooks are treated as a first-class observable runtime, not just subprocesses that occasionally mutate host state.
+
+---
+
+# Codex research — hook-run classification (#25 blockers)
+
+Asset for `docs/decision-maps/pi-hooks-hook-run-classification.md`. Source: Codex `codex-rs`
+(`hooks/src/engine/{command_runner,dispatcher,output_parser}.rs`, `hooks/src/events/*.rs`,
+`protocol/src/protocol.rs`). Findings only; Pi decisions live in the decision map.
+
+## Runner: `command_runner.rs` (owns timing only)
+
+`run_command` → `CommandRunResult { started_at, completed_at, duration_ms, exit_code, stdout, stderr, error }`. No `status`. Outcomes:
+- spawn fail → `error=Some`, stdout empty, `outcome:"spawn_error"`
+- stdin write fail → kill child, `error=Some("failed to write hook stdin: …")`, `outcome:"stdin_error"`
+- wait error → `outcome:"wait_error"`
+- **timeout → stdout DISCARDED (empty), `error=Some("hook timed out after Ns")`, `outcome:"timeout"`**
+- exit 0 → stdout preserved, `outcome:"completed"`
+
+**No abort/shutdown cancellation path exists in Codex's runner.** Only timeout.
+
+## Dispatcher: `dispatcher.rs` (owns status + entries, built AFTER runner returns)
+
+- `running_summary(handler)` → status `Running`, `completed_at=None`, entries empty (in flight).
+- `completed_summary(handler, run_result, status, entries)` → status∈{Completed,Failed,Blocked,Stopped}, `completed_at=Some`, `duration_ms=Some`, entries filled.
+- Dispatcher builds the completed summary **after** `run_command` returns. Runner owns timing; dispatcher owns status+entries. This is the "option (a)" split.
+
+## Protocol model: `protocol.rs`
+
+- `HookRunStatus = Running | Completed | Failed | Blocked | Stopped` (5).
+- `HookOutputEntryKind = Warning | Stop | Feedback | Context | Error` (5).
+- `HookOutputEntry { kind, text }`. `HookRunSummary` carries id/event/scope/source/display_order/status/status_message/started_at/completed_at/duration_ms/entries.
+
+## Status assignment (event handlers, e.g. `session_start.rs:222-320`, `post_tool_use.rs:169-250`, `pre_tool_use.rs:196-270`, `user_prompt_submit.rs:141-190`)
+
+Uniform pattern across events:
+- `error` set (spawn/stdin/wait/**timeout**) → `Failed` + `Error` entry(text=error).
+- exit 0 + empty stdout → `Completed` (no entries).
+- exit 0 + valid JSON parse → `Completed` + entries from parsed fields (`Warning`=systemMessage, `Context`/`Feedback`=additionalContext). `continue:false` (SessionStart only) → `Stopped` + `Stop` entry(stopReason) + stop_reason propagated to outcome.
+- exit 0 + **looks-like-JSON but parse fails** → `Failed` + `Error` entry("hook returned invalid <event> JSON output"). **Invalid semantic stdout collapses to `Failed`, not a separate status.**
+- exit 0 + non-JSON stdout → `Completed` + `Context` entry(plain stdout as context).
+- nonzero exit → `Failed` + `Error` entry("hook exited with code N").
+- no exit code → `Failed` + `Error` entry("hook exited without a status code").
+
+Terminal-intent specifics:
+- PostToolUse `decision:block` + non-empty reason → `Blocked` + `Feedback` entry(reason) + reason fed to model.
+- PreToolUse `decision:block`/`permissionDecision:deny` + non-empty reason → `Blocked`; block_reason pushed as entry. stderr-only block (exit 2 + stderr reason) also → `Blocked`.
+- UserPromptSubmit `decision:block` → `Blocked`. `continue:false` (with stopReason) → `Stopped` + `Stop` entry.
+- SessionStart `continue:false` → `Stopped`; `additionalContext` injection → `Completed` + `Context`.
+- Serialization failure before run → `Failed` + `Error` entry, duration_ms=0 (`common.rs:65`).
+
+**Interruption wins structurally:** timeout discards stdout, so the dispatcher never sees an envelope → `Blocked`/`Stopped` are unobservable on a timed-out run (a valid block envelope written before timeout is lost). Timeout is always `Failed`.
+
+## Retention: emit-and-drop (Codex) — the Pi divergence crux
+
+`HookCompletedEvent` is emitted as a protocol event and **not retained** in any session-scoped
+store. Confirmed: `rg HookCompletedEvent` hits only `hooks/src/events/*` (producers) and
+`engine/dispatcher.rs`; no `retain|history|push` buffer in `core/src/session`. Codex can emit-and-drop because it has an outbound protocol event channel. **Pi is a TypeScript extension with no
+outbound protocol event** → the only observable channel for a finalized classification is a
+session-scoped store. This forces Pi to retain where Codex emits.
+
+## Notifications: `legacy_notify.rs` — reverse direction, no failure surfacing
+
+`legacy_notify.rs` builds an `AgentTurnComplete` payload **appended to a user's configured notify
+hook argv** — i.e. the **host calling a user hook** (host → user-hook), NOT the host surfacing
+hook failures to the user. There is **no in-Codex mechanism that proactively notifies the user of
+hook failures**. Failures surface only as `Error`-kind `HookOutputEntry` in emitted
+`HookCompletedEvent` (consumed by the TUI/CLI, which gates display). **No repetition threshold, no
+seam-importance gate** in Codex — every `Failed` run emits its `Error` entry and the surface
+decides what to show.
+
+## Implications for Pi (decisions applied in the decision map, not here)
+
+1. Runner-owns-timing + dispatcher-owns-status+entries is the validated split → Pi "option (a)".
+2. 5-status taxonomy confirmed viable; Pi renames `Stopped`→`handled` (Pi `input` handled) and maps `before_agent_start` shaping → `completed` (no stop semantics in Pi).
+3. Invalid-semantic-stdout collapses to `failed`+`error` (entry text identifies it) — keeps taxonomy at 5 and gives #3 a countable signal.
+4. Timeout→`failed`; interruption wins; `shutdown`/`abort`→`failed` with distinct reason (shutdown silenced at notification layer).
+5. Pi must retain session-scoped where Codex emits (extension has no protocol event).
+6. Codex emits-all-errors + surface-gates; Pi #6's "repeated/important-seams" nuance is a NOTIFICATION-layer gate, not a classification-layer suppression — record all, gate later.

@@ -194,7 +194,7 @@ Model:
 - attach warnings/errors/ignored-stdout diagnostics to that run record
 - include those runs in the active footer status while they are still live
 - do not surface routine completion in visible UI; keep it in run state only
-- use notifications only for notable failures such as timeout or repeated malformed semantic-looking stdout on important seams
+- use notifications only for notable failures such as timeout or repeated malformed semantic-looking stdout on important seams; this threshold is a **notification-layer display gate**, not a classification-layer suppression — the classifier (#25 decision map) always records all classifications (`failed`/`blocked`/`stopped`), and the notifier decides what to surface. `stopped` runs (timeout/abort/shutdown) are non-failures and never notify
 
 Important boundary:
 
@@ -330,3 +330,181 @@ Implementation order inside the slice:
 4. wire active-run aggregation into `ctx.ui.setStatus(...)`
 
 With this ticket resolved, the path to implementation is clear and the decision map is done.
+
+---
+
+# Decision Map — Pi Hooks hook-run classification (#25 blockers)
+
+Resolved (Pi-native). Codex research asset: `docs/research/codex-hook-run-classification.md`.
+Decisions below **defer to** `pi-hooks-operational-loop.md` #8 (pre-existing Pi-native status
+mapping) and `pi-hooks-runtime.md` #5 (session-scoped, clear on `session_shutdown`).
+
+Pi-native north star: Pi is a TypeScript extension with **no outbound protocol event** and a
+`runCommandHook` that finalizes-in-`finally` (#24). Codex is guidance, not law. operational-loop
+#8 already made the deliberate Pi-native divergences from Codex on the two contested points
+(`input` handled → `completed`, not a separate status; interruption → `stopped`, not `failed`).
+This map does NOT override #8 — it inherits it. Where Codex helped: the runner-owns-timing vs
+dispatcher-owns-status+entries split (option a), the 5-kind typed-entry shape, the collapse of
+invalid-stdout into `failed`+entry, and the emit-all-then-gate layering for notifications.
+
+## #1: How are hook runs classified into terminal status + typed entries? (B3)
+
+Blocked by: —
+Type: Research — RESOLVED
+
+### Question
+
+Where does terminal classification live — runner or dispatcher — and what is the status taxonomy
+
+- typed-entry shape for the first slice? How to classify `blocked` (tool_call), `input` handled,
+  `before_agent_start` shaping, failures, interruption, and invalid semantic stdout?
+
+### Answer
+
+**Split: mirror Codex — runner owns timing, dispatcher owns status+entries (option a).**
+`finishHookRun` (in the runner's `finally`, per #24) writes the finalized record into a new
+**session-scoped `finalizedHookRuns` store** (cleared on `session_shutdown` per runtime #5) with
+terminal timing + operational status (`completed`/`failed`/`stopped`+`reason`+`completedAt`)
+**instead of deleting it**. The dispatcher then **augments** the persisted record with terminal
+classification (`blocked`) + typed `entries[]`. This preserves #25 acceptance criterion 2 ("late
+failures finalize through the same runner path as awaited hooks") — finalize stays a single point
+in the runner; the dispatcher only augments.
+_Divergence from Codex forced:_ Codex emits `running_summary`+`completed_summary` as protocol
+events and retains nothing; Pi has no outbound protocol event, so the session-scoped store is the
+only observable channel. This store is **internal ownership state** for classification
+observability — NOT the deleted #7 cross-run inspection UI (that was user-facing cross-session;
+this is session-scoped, cleared on shutdown, internal-only).
+
+**Taxonomy: 5 statuses — inherit `pi-hooks-operational-loop.md` #8 verbatim (Pi-native, not
+re-derived from Codex):** `{running, completed, failed, blocked, stopped}`:
+
+- `running` — in-flight (#24).
+- `completed` — normal success, incl. observe-only no-op, successful `before_agent_start` shaping
+  (system-prompt replacement / message injection — Pi-native: this event **shapes**, it does not
+  stop the turn), successful `tool_result` feedback, **and `input` `handled`** (per #8: _"input
+  handled stays completed; it is a semantic terminal result, not an operational failure or operator
+  stop"_). Semantic color for handled is carried by a typed entry, NOT a status.
+- `failed` — spawn_error / stdin_error / nonzero_exit / **invalid-semantic-stdout**.
+  **Collapsed** (mirrors Codex): invalid-stdout is NOT a 6th status and is NOT `stopped`; it is
+  `failed` with `reason: invalid_stdout` (#8) + an `error` entry whose text identifies it. This
+  keeps taxonomy at 5 and gives #3 a countable `failed`+`error` signal.
+- `blocked` — `tool_call` `decision:block` with non-empty reason (terminal). Status-level per #8.
+- `stopped` — operator/runtime interruption before normal completion, with `reason` `timeout` /
+  `abort` / `shutdown` (#8). **Pi-native divergence from Codex:** Codex has no abort/shutdown path
+  and routes timeout→`failed`; Pi treats interruption as a distinct non-failure operational
+  terminal `stopped`. Do NOT copy Codex's `timeout→failed`.
+
+**Typed entries: 5 kinds, Pi-native names** `{warning, stop, feedback, context, error}` (per #8:
+"add semantic color as a typed run entry, not as new always-present top-level fields"):
+
+- `warning` — `systemMessage` from a semantic envelope.
+- `stop` — `input` handled take-over reason text (semantic color for the `completed`-with-handled
+  run, since `handled` is NOT a status).
+- `feedback` — `tool_call` block reason fed to model + injected context (`tool_result` /
+  `before_agent_start`).
+- `context` — plain non-JSON stdout as context (observe-only context-setting run).
+- `error` — failure text; text discriminates the failure kind (spawn/stdin/nonzero/invalid-stdout)
+  so #3 can count invalid-stdout without a 6th status. `stopped` runs do NOT get `error`
+  entries — interruption is not a failure (its reason lives in the top-level `reason` field, #8).
+
+`completedAt` always set on finalize; `startedAt` from `startHookRun`.
+
+## #2: What precedence applies when a run is both cancelled/interrupted and semantically terminal? (B2)
+
+Blocked by: #1
+Type: Research — RESOLVED
+
+### Question
+
+If a child writes a valid `block`/`handled` envelope AND is simultaneously aborted/timed-out/
+shutdown-cancelled, which terminal wins? Is the semantic envelope observable at all on an
+interrupted run?
+
+### Answer
+
+**Interruption wins; a semantic terminal cannot be observed on a cancelled/aborted/timed-out
+run.** No exceptions in the first slice. Matches current Pi behavior (any `cancellationReason`
+short-circuits before the stdout-parse branch, so stdout is never parsed → dispatcher gets
+`undefined`) and Codex's structural behavior (timeout discards stdout → no envelope observable).
+
+**Interruption → `stopped` + `reason` (Pi-native per #8), NOT `failed`.** This is the deliberate
+Pi-native divergence from Codex (which routes timeout→`failed` because it has no abort/shutdown
+path). Routes:
+
+- timeout → `stopped`, `reason: "timeout"` (Pi-native; Codex-guided `failed` rejected as
+  non-Pi-native).
+- abort (user cancel) → `stopped`, `reason: "abort"`.
+- shutdown (operator teardown, per runtime #5) → `stopped`, `reason: "shutdown"`.
+
+No `error` entry on `stopped` (interruption is not a failure; reason is the discriminator). The new
+globals reset #24 added (`activeHookRuns`, `nextHookRunDisplayOrder`, `lastHookStatusSink`) plus
+the new `finalizedHookRuns` store are all cleared on `session_shutdown` per runtime #5 — so a run
+in flight at shutdown is finalized to `stopped`+`reason:shutdown` before/into the clear (the
+runner's `finally` runs first; `cancelActiveHookExecutions("shutdown")` already triggers this).
+
+## #3: What does #25 emit for a later notification slice, and what triggers it? (B1)
+
+Blocked by: #1, #2
+Type: Research — RESOLVED
+
+### Question
+
+Does #25 (classification-only) need to emit anything consumable by a future notification slice, or
+only classify in-session state? If emit: what status set triggers it, is there a repetition
+threshold for repeated invalid/failed stdout, and are seam-importance + operator-initiated
+(`shutdown`/`abort`) silencing required?
+
+### Answer
+
+**#25 records classification AND wires notification in the same issue** (folded, no follow-up
+issue). The session-scoped `finalizedHookRuns` store from #1 IS Pi's "emit" — an extension has no
+protocol broadcast. A second slice inside #25 reads that store and applies the notification gate.
+This collapses the blocked dependency chain the original "defer to a follow-up" plan would have
+created, and matches the existing #25 body's permissive "notable failures/timeouts may use the
+already-approved notification path" note (now made concrete). The issue stays vertical-TDD
+friendly by being structured as two labeled slices: Slice A (classification + finalized store) and
+Slice B (notification wiring reading the store).
+
+**Trigger threshold: defined in #25's notification slice (Slice B), not deferred.** Codex research
+validated the layering (classifier records all; surface gates) but NOT that the gate belongs in a
+separate issue. #25 Slice B applies the gate per operational-loop #6 (reworded): classify faithfully
+in Slice A; gate in Slice B. Concretely: notify on `failed` (spawn/stdin/nonzero/invalid_stdout)
+and optionally `blocked`; **never** notify on `stopped` (timeout/abort/shutdown are non-failures,
+so operator teardown is structurally silenced with no extra field); apply a **repetition
+threshold** for repeated `failed`+`invalid_stdout` (≥ N occurrences on the same seam within the
+session) and a **seam-importance gate** (important seams = the 4 semantic-stdout events
+`input`/`before_agent_start`/`tool_call`/`tool_result` where classification has semantic meaning;
+observe-only non-semantic-stdout runs that fail nonzero are fail-open and do not notify).
+
+**Note: `stopped` runs are inherently non-failures** (#1/#2), so a notification slice keying on
+"failures" (`failed`/`blocked`) naturally never fires on `timeout`/`abort`/`shutdown`. This means
+the operator-teardown silence the reviewer worried about is already structurally handled by the
+`stopped`≠`failed` split (Pi-native, #8) — no extra silence-mask field is needed. `blocked` may or
+may not notify (it's a deliberate hook block, not a failure); defer that choice to the
+notification slice.
+
+**Reconciling edit to `pi-hooks-operational-loop.md` #6** (applied separately): reword to specify
+that _"repeated malformed semantic-looking stdout on important seams"_ is a **notification-layer
+display gate**, not a classification-layer suppression. The classifier always records; the
+notifier decides what to surface. This resolves the tension between Codex's emit-all approach and
+#6's nuanced wording without weakening either: faithful classification + gated notification.
+
+## Map status: DONE
+
+Frontier cleared. Path to #25 spec revision is unambiguous:
+
+1. Spec #25 pins: option-(a) split + session-scoped `finalizedHookRuns` store (cleared on
+   `session_shutdown`); inherit operational-loop #8's 5-status taxonomy `running|completed|failed|
+blocked|stopped`; 5-kind `warning|stop|feedback|context|error` entries; `failed` collapses
+   invalid-stdout (reason `invalid_stdout` + `error` entry); interruption→`stopped`+reason
+   (timeout/abort/shutdown), NOT `failed`; `input` handled→`completed`+`stop` entry.
+2. Spec #25 scope: Slice A = classification + session-scoped `finalizedHookRuns` store (cleared on
+   `session_shutdown`); Slice B = notification wiring reading the same store. Single issue, two
+   labeled vertical-TDD slices. No follow-up issue, no #26.
+3. Slice B gate (concrete): notify on `failed` (reasons spawn/stdin/nonzero/invalid_stdout) and
+   `blocked`; never on `stopped`; repetition threshold ≥ N repeated `failed`+`invalid_stdout` per
+   seam per session; seam-importance gate = semantic-stdout events only; observe-only nonzero-exit
+   failures are fail-open and do not notify.
+
+One external edit required: reword `pi-hooks-operational-loop.md` #6 (notification-layer gate).
+
