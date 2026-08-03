@@ -378,12 +378,37 @@ type HookStatusSink = {
     setStatus(key: string, text: string | undefined): void
 }
 
+type HookNotifySink = {
+    notify(message: string, options?: unknown): void
+}
+
 type HookRunRecord = {
     id: string
     eventName: string
     statusMessage: string | undefined
     startedAt: number
     displayOrder: number
+}
+
+type HookRunStatus = "running" | "completed" | "failed" | "blocked" | "stopped"
+
+type HookOutputEntryKind = "warning" | "stop" | "feedback" | "context" | "error"
+
+type HookOutputEntry = {
+    kind: HookOutputEntryKind
+    text: string
+}
+
+type FinalizedHookRun = {
+    id: string
+    eventName: string
+    status: HookRunStatus
+    reason: string | undefined
+    startedAt: number
+    completedAt: number
+    displayOrder: number
+    statusMessage: string | undefined
+    entries: HookOutputEntry[]
 }
 
 const HOOK_PROTOCOL_VERSION = 1 as const
@@ -534,6 +559,11 @@ let activeHookExecutions = new Set<ActiveHookExecution>()
 let activeHookRuns = new Map<string, HookRunRecord>()
 let nextHookRunDisplayOrder = 0
 let lastHookStatusSink: HookStatusSink | undefined
+let finalizedHookRuns = new Map<string, FinalizedHookRun>()
+let lastHookNotifySink: HookNotifySink | undefined
+let hookInvalidStdoutCounts = new Map<string, number>()
+let hookInvalidStdoutNotified = new Set<string>()
+const HOOK_INVALID_STDOUT_NOTIFY_THRESHOLD = 2
 
 const hooksSchema = loadHooksSchema()
 const validateHooksSchema = compileJsonSchemaValidator(hooksSchema)
@@ -624,6 +654,9 @@ export default function setup(pi: ExtensionAPI) {
         activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
         activeBeforeAgentStartSlots = compileBeforeAgentStartHookSlots(activeRegistry)
         ensureBeforeAgentStartSlotHandlers(activeBeforeAgentStartSlots.length)
+        finalizedHookRuns.clear()
+        hookInvalidStdoutCounts.clear()
+        hookInvalidStdoutNotified.clear()
         dispatchSessionStartHooks(event, ctx)
     })
 
@@ -730,8 +763,12 @@ export default function setup(pi: ExtensionAPI) {
         activeBeforeAgentStartSlots = []
         cancelActiveHookExecutions("shutdown")
         activeHookRuns.clear()
+        finalizedHookRuns.clear()
+        hookInvalidStdoutCounts.clear()
+        hookInvalidStdoutNotified.clear()
         renderHookStatus()
         lastHookStatusSink = undefined
+        lastHookNotifySink = undefined
         nextHookRunDisplayOrder = 0
         dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
     })
@@ -1086,10 +1123,23 @@ function getHookStatusSink(value: unknown): HookStatusSink | undefined {
     return typeof value.setStatus === "function" ? (value as HookStatusSink) : undefined
 }
 
+function getHookNotifySink(value: unknown): HookNotifySink | undefined {
+    if (typeof value !== "object" || value === null || !("notify" in value)) {
+        return undefined
+    }
+
+    return typeof value.notify === "function" ? (value as HookNotifySink) : undefined
+}
+
 function startHookRun(options: { eventName: string; statusMessage: string | undefined; statusUi?: unknown }) {
     const statusSink = getHookStatusSink(options.statusUi)
     if (statusSink !== undefined) {
         lastHookStatusSink = statusSink
+    }
+
+    const notifySink = getHookNotifySink(options.statusUi)
+    if (notifySink !== undefined) {
+        lastHookNotifySink = notifySink
     }
 
     const displayOrder = nextHookRunDisplayOrder
@@ -1108,12 +1158,83 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
     return run.id
 }
 
-function finishHookRun(runId: string) {
-    if (!activeHookRuns.delete(runId)) {
+function finishHookRun(
+    runId: string,
+    finalization: { status: HookRunStatus; reason?: string; entries?: HookOutputEntry[] },
+) {
+    const activeRun = activeHookRuns.get(runId)
+    if (activeRun === undefined) {
         return
     }
 
+    activeHookRuns.delete(runId)
+    const finalizedRun: FinalizedHookRun = {
+        id: activeRun.id,
+        eventName: activeRun.eventName,
+        status: finalization.status,
+        reason: finalization.reason,
+        startedAt: activeRun.startedAt,
+        completedAt: Date.now(),
+        displayOrder: activeRun.displayOrder,
+        statusMessage: activeRun.statusMessage,
+        entries: finalization.entries ?? [],
+    }
+    finalizedHookRuns.set(runId, finalizedRun)
+    notifyOnFinalize(finalizedRun)
     renderHookStatus()
+}
+
+function notifyOnFinalize(run: FinalizedHookRun) {
+    if (lastHookNotifySink === undefined) {
+        return
+    }
+
+    if (run.status === "completed" || run.status === "running") {
+        return
+    }
+
+    if (run.status === "stopped") {
+        return
+    }
+
+    const isImportantSeam = SEMANTIC_STDOUT_EVENT_NAMES.has(
+        run.eventName as "input" | "before_agent_start" | "tool_call" | "tool_result",
+    )
+
+    if (run.status === "blocked") {
+        lastHookNotifySink.notify(`Hook ${run.eventName} blocked`)
+        return
+    }
+
+    if (!isImportantSeam) {
+        return
+    }
+
+    if (run.reason === "invalid_stdout") {
+        const count = (hookInvalidStdoutCounts.get(run.eventName) ?? 0) + 1
+        hookInvalidStdoutCounts.set(run.eventName, count)
+        if (count < HOOK_INVALID_STDOUT_NOTIFY_THRESHOLD || hookInvalidStdoutNotified.has(run.eventName)) {
+            return
+        }
+
+        hookInvalidStdoutNotified.add(run.eventName)
+    }
+
+    lastHookNotifySink.notify(`Hook ${run.eventName} ${run.status}${run.reason === undefined ? "" : `: ${run.reason}`}`)
+}
+
+export function getFinalizedHookRuns(): FinalizedHookRun[] {
+    return [...finalizedHookRuns.values()].sort((left, right) => {
+        if (left.completedAt !== right.completedAt) {
+            return left.completedAt - right.completedAt
+        }
+
+        if (left.displayOrder !== right.displayOrder) {
+            return left.displayOrder - right.displayOrder
+        }
+
+        return left.id.localeCompare(right.id)
+    })
 }
 
 function renderHookStatus() {
@@ -1602,6 +1723,14 @@ async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Pro
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
                             statusUi: ctx.ui,
+                            classifyOutput: (envelope) => {
+                                const output = envelope.output as InputHookResult
+                                if (output.action === "handled") {
+                                    return { entries: [{ kind: "stop", text: "input handled by hook" }] }
+                                }
+
+                                return {}
+                            },
                         })
                     } catch (error) {
                         console.warn(
@@ -1728,6 +1857,17 @@ async function dispatchToolCallHooks(
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
                             statusUi: ctx.ui,
+                            classifyOutput: (envelope) => {
+                                const output = envelope.output as ToolCallHookResult
+                                if ("block" in output) {
+                                    return {
+                                        status: "blocked",
+                                        entries: [{ kind: "feedback", text: output.block.reason ?? "" }],
+                                    }
+                                }
+
+                                return {}
+                            },
                         })
                     } catch (error) {
                         console.warn(
@@ -1936,6 +2076,7 @@ async function runCommandHook(options: {
     abortSignal?: AbortSignal
     consumeStdout?: boolean
     statusUi?: unknown
+    classifyOutput?: (envelope: HookStdoutEnvelope) => { status?: HookRunStatus; entries?: HookOutputEntry[] }
 }): Promise<HookStdoutEnvelope | undefined> {
     const hookRunId = startHookRun({
         eventName: options.payload.event,
@@ -1980,6 +2121,11 @@ async function runCommandHook(options: {
         if (timeoutHandle !== undefined) {
             clearTimeout(timeoutHandle)
         }
+    }
+
+    let finalization: { status: HookRunStatus; reason?: string; entries?: HookOutputEntry[] } = {
+        status: "completed",
+        entries: [],
     }
 
     try {
@@ -2036,6 +2182,7 @@ async function runCommandHook(options: {
                     `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
                 )
             }
+            finalization = { status: "stopped", reason: "timeout", entries: [] }
             return
         }
 
@@ -2043,10 +2190,12 @@ async function runCommandHook(options: {
             if (reportFailures) {
                 console.warn(`Hook command aborted: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`)
             }
+            finalization = { status: "stopped", reason: "abort", entries: [] }
             return
         }
 
         if (activeExecution.cancellationReason === "shutdown") {
+            finalization = { status: "stopped", reason: "shutdown", entries: [] }
             return
         }
 
@@ -2054,11 +2203,27 @@ async function runCommandHook(options: {
             const parsedStdout = parseHookStdout({ stdout, eventName: options.payload.event })
             if (parsedStdout.kind === "invalid") {
                 console.warn(`${parsedStdout.warning}\nstdout: ${stdout}\nstderr: ${stderr}`)
+                finalization = {
+                    status: "failed",
+                    reason: "invalid_stdout",
+                    entries: [{ kind: "error", text: parsedStdout.warning }],
+                }
                 return
             }
 
             if (parsedStdout.kind === "valid") {
                 if (options.consumeStdout) {
+                    if (options.classifyOutput !== undefined) {
+                        const semantic = options.classifyOutput(parsedStdout.envelope)
+                        if (semantic.status !== undefined) {
+                            finalization.status = semantic.status
+                        }
+
+                        if (semantic.entries !== undefined) {
+                            finalization.entries = semantic.entries
+                        }
+                    }
+
                     return parsedStdout.envelope
                 }
 
@@ -2076,8 +2241,31 @@ async function runCommandHook(options: {
                 `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
             )
         }
+
+        finalization = {
+            status: "failed",
+            reason: "nonzero_exit",
+            entries: [{ kind: "error", text: `hook command exited with exit code ${exitCode ?? "unknown"}` }],
+        }
+    } catch (error) {
+        if (activeExecution.cancellationReason !== undefined) {
+            finalization = {
+                status: "stopped",
+                reason: activeExecution.cancellationReason,
+                entries: [],
+            }
+            return
+        }
+
+        const reason = /stdin/i.test(toErrorMessage(error)) ? "stdin_error" : "spawn_error"
+        finalization = {
+            status: "failed",
+            reason,
+            entries: [{ kind: "error", text: toErrorMessage(error) }],
+        }
+        throw error
     } finally {
-        finishHookRun(hookRunId)
+        finishHookRun(hookRunId, finalization)
     }
 }
 
