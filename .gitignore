@@ -4,6 +4,8 @@ coverage/
 *.tsbuildinfo
 .DS_Store
 
-# Pi coding agent
+# Pi
 .pi-subagents/
 
+# Codex
+.codex/
