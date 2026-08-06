@@ -2,10 +2,6 @@
 
 Related assets:
 
-- `docs/research/codex-hooks-findings.md`
-- `docs/research/codex-hooks-operational-loop.md`
-- `docs/research/pi-extension-operational-surface.md`
-- `docs/decision-maps/pi-hooks-runtime.md`
 - `node_modules/@earendil-works/pi-coding-agent/docs/extensions.md`
 
 ## #1: Should this planning effort stay Pi-native or copy Codex’s protocol whole-cloth?
@@ -60,29 +56,29 @@ Adopt one session-scoped `HookRunRecord` per selected hook. This should become t
 Minimum shape:
 
 - identity
-  - `id`
-  - `eventName`
-  - `sourcePath`
-  - normalized `matcher`
-  - `command`
-  - `displayOrder`
-  - optional config `statusMessage`
+    - `id`
+    - `eventName`
+    - `sourcePath`
+    - normalized `matcher`
+    - `command`
+    - `displayOrder`
+    - optional config `statusMessage`
 - lifecycle
-  - `startedAt`
-  - `completedAt?`
-  - derived `durationMs?`
+    - `startedAt`
+    - `completedAt?`
+    - derived `durationMs?`
 - status
-  - `running`
-  - `completed`
-  - `failed`
-  - `blocked`
-  - `stopped`
+    - `running`
+    - `completed`
+    - `failed`
+    - `blocked`
+    - `stopped`
 - entries
-  - typed `entries[]` owned by Pi Hooks, not by raw stdout
-  - minimum entry kinds: `warning`, `error`, `feedback`, `context`, `semantic`
+    - typed `entries[]` owned by Pi Hooks, not by raw stdout
+    - minimum entry kinds: `warning`, `error`, `feedback`, `context`, `semantic`
 - optional semantic summary
-  - a small event-specific summary field is allowed on the run record
-  - but canonical semantic aggregation still lives in the event-specific dispatchers (`input`, `before_agent_start`, `tool_call`, `tool_result`)
+    - a small event-specific summary field is allowed on the run record
+    - but canonical semantic aggregation still lives in the event-specific dispatchers (`input`, `before_agent_start`, `tool_call`, `tool_result`)
 
 Important decision:
 
@@ -151,12 +147,12 @@ Rules:
 - sort active runs by `(startedAt, displayOrder, id)` for deterministic collapse
 - if there are no active runs, clear the status with `ctx.ui.setStatus(key, undefined)`
 - if there is exactly one active run:
-  - show its configured `statusMessage` when present
-  - otherwise show a Pi-owned fallback like `Running <eventName> hook`
+    - show its configured `statusMessage` when present
+    - otherwise show a Pi-owned fallback like `Running <eventName> hook`
 - if there are multiple active runs:
-  - show a compact aggregate like `Running 3 hooks: Loading session notes (+2 more)`
-  - use the first active run’s configured `statusMessage` when present as the lead label
-  - otherwise use a Pi-owned fallback label derived from the first active run’s event
+    - show a compact aggregate like `Running 3 hooks: Loading session notes (+2 more)`
+    - use the first active run’s configured `statusMessage` when present as the lead label
+    - otherwise use a Pi-owned fallback label derived from the first active run’s event
 
 Non-rules:
 
@@ -221,21 +217,21 @@ Keep the status taxonomy minimal and Pi-native. Do not carry more top-level fiel
 Use:
 
 - `status`
-  - `running`
-  - `completed`
-  - `failed`
-  - `blocked`
-  - `stopped`
+    - `running`
+    - `completed`
+    - `failed`
+    - `blocked`
+    - `stopped`
 - `reason?`
-  - only present when `status` alone is not enough
-  - values:
-    - `timeout`
-    - `abort`
-    - `shutdown`
-    - `spawn_error`
-    - `stdin_error`
-    - `nonzero_exit`
-    - `invalid_stdout`
+    - only present when `status` alone is not enough
+    - values:
+        - `timeout`
+        - `abort`
+        - `shutdown`
+        - `spawn_error`
+        - `stdin_error`
+        - `nonzero_exit`
+        - `invalid_stdout`
 
 Do not add a separate `semanticOutcome` field to the generic run record.
 
@@ -507,4 +503,3 @@ blocked|stopped`; 5-kind `warning|stop|feedback|context|error` entries; `failed`
    failures are fail-open and do not notify.
 
 One external edit required: reword `pi-hooks-operational-loop.md` #6 (notification-layer gate).
-

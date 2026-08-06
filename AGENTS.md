@@ -13,3 +13,9 @@ Use the default five-label vocabulary: `needs-triage`, `needs-info`, `ready-for-
 ### Domain docs
 
 Single-context repo: read `CONTEXT.md` at the repo root and `docs/adr/` for architectural decisions. See `docs/agents/domain.md`.
+
+## Decision maps
+
+1. `docs/decision-maps/pi-hooks-hooks-json.md` — config shape, validation, and discovery
+2. `docs/decision-maps/pi-hooks-runtime.md` — runtime seams, matcher semantics, and stdout contract
+3. `docs/decision-maps/pi-hooks-operational-loop.md` — hook-run observability, status, and TUI/operator flow
