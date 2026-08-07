@@ -501,7 +501,9 @@ function createDelayedStdoutHookCommand(stdout: string, delayMs: number) {
 function createUiDouble() {
     return {
         setStatus: vi.fn(),
-        notify: vi.fn(),
+        notify: vi.fn((message: string) => {
+            console.warn(message)
+        }),
         select: vi.fn(),
         confirm: vi.fn(),
         input: vi.fn(),
@@ -705,9 +707,10 @@ describe("pi hooks loader", () => {
         )
 
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const ui = createUiDouble()
 
         try {
-            const registry = await loadUserHooksRegistry({ homeDir })
+            const registry = await loadUserHooksRegistry({ homeDir, notifyUi: ui })
 
             expect(registry.files[0]?.events[0]?.matcherGroups).toHaveLength(1)
             expect(registry.files[0]?.events[0]?.matcherGroups[0]?.normalizedMatcher).toEqual({
@@ -725,9 +728,12 @@ describe("pi hooks loader", () => {
         const sourcePath = join(homeDir, ".pi", "hooks.json")
         await writeFile(sourcePath, "{not valid json")
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const ui = createUiDouble()
 
         try {
-            await expect(loadUserHooksRegistry({ homeDir })).resolves.toEqual({ files: [] } satisfies HookRegistry)
+            await expect(loadUserHooksRegistry({ homeDir, notifyUi: ui })).resolves.toEqual({
+                files: [],
+            } satisfies HookRegistry)
             expect(warn).toHaveBeenCalledWith(expect.stringContaining(sourcePath))
             expect(warn).toHaveBeenCalledWith(expect.stringMatching(/Unexpected token|Expected property name/))
         } finally {
@@ -752,9 +758,12 @@ describe("pi hooks loader", () => {
             }),
         )
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const ui = createUiDouble()
 
         try {
-            await expect(loadUserHooksRegistry({ homeDir })).resolves.toEqual({ files: [] } satisfies HookRegistry)
+            await expect(loadUserHooksRegistry({ homeDir, notifyUi: ui })).resolves.toEqual({
+                files: [],
+            } satisfies HookRegistry)
             expect(warn).toHaveBeenCalledWith(expect.stringContaining(sourcePath))
             expect(warn).toHaveBeenCalledWith(expect.stringContaining("unexpected"))
         } finally {
@@ -767,9 +776,12 @@ describe("pi hooks loader", () => {
         const sourcePath = join(homeDir, ".pi", "hooks.json")
         await writeFile(sourcePath, JSON.stringify({ hooks: {} }))
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const ui = createUiDouble()
 
         try {
-            await expect(loadUserHooksRegistry({ homeDir })).resolves.toEqual({ files: [] } satisfies HookRegistry)
+            await expect(loadUserHooksRegistry({ homeDir, notifyUi: ui })).resolves.toEqual({
+                files: [],
+            } satisfies HookRegistry)
             expect(warn).toHaveBeenCalledWith(expect.stringContaining(sourcePath))
             expect(warn).toHaveBeenCalledWith(expect.stringContaining("must NOT have fewer than 1 properties"))
         } finally {
@@ -813,9 +825,10 @@ describe("pi hooks loader", () => {
             }),
         )
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const ui = createUiDouble()
 
         try {
-            const registry = await loadHooksRegistry({ homeDir, cwd: projectDir })
+            const registry = await loadHooksRegistry({ homeDir, cwd: projectDir, notifyUi: ui })
 
             expect(registry.files.map((file) => file.sourcePath)).toEqual([
                 join(homeDir, ".pi", "hooks.json"),
@@ -857,9 +870,10 @@ describe("pi hooks loader", () => {
             }),
         )
         const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+        const ui = createUiDouble()
 
         try {
-            const registry = await loadHooksRegistry({ homeDir, cwd: projectDir })
+            const registry = await loadHooksRegistry({ homeDir, cwd: projectDir, notifyUi: ui })
 
             expect(registry.files.map((file) => file.sourcePath)).toEqual([
                 join(homeDir, ".pi", "hooks.json"),
@@ -3471,13 +3485,14 @@ describe("pi hooks loader", () => {
         try {
             const { pi, handlers } = createExtensionApiDouble()
             setup(pi)
+            const ui = createUiDouble()
 
             const sessionStart = getSessionStartHandler(handlers)
             const sessionCompact = getSessionCompactHandler(handlers)
 
             await sessionStart?.(
                 { type: "session_start", reason: "startup" },
-                createExtensionContext(canonicalProjectDir),
+                createExtensionContext(canonicalProjectDir, { ui }),
             )
 
             expect(
@@ -3489,12 +3504,15 @@ describe("pi hooks loader", () => {
                         reason: "manual",
                         willRetry: false,
                     },
-                    createExtensionContext(canonicalProjectDir),
+                    createExtensionContext(canonicalProjectDir, { ui }),
                 ),
             ).toBeUndefined()
             await vi.waitFor(() => {
-                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
-                expect(warn).toHaveBeenCalledWith(expect.stringContaining("write EPIPE"))
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Hook command failed before completion"),
+                    "warning",
+                )
+                expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("write EPIPE"), "warning")
             })
         } finally {
             warn.mockRestore()
@@ -3538,13 +3556,14 @@ describe("pi hooks loader", () => {
         try {
             const { pi, handlers } = createExtensionApiDouble()
             setup(pi)
+            const ui = createUiDouble()
 
             const sessionStart = getSessionStartHandler(handlers)
             const sessionBeforeSwitch = getSessionBeforeSwitchHandler(handlers)
 
             await sessionStart?.(
                 { type: "session_start", reason: "startup" },
-                createExtensionContext(canonicalProjectDir),
+                createExtensionContext(canonicalProjectDir, { ui }),
             )
 
             expect(
@@ -3553,12 +3572,15 @@ describe("pi hooks loader", () => {
                         type: "session_before_switch",
                         reason: "new",
                     },
-                    createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
+                    createExtensionContext(join(canonicalProjectDir, "missing-cwd"), { ui }),
                 ),
             ).toBeUndefined()
             await vi.waitFor(() => {
-                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
-                expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i))
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Hook command failed before completion"),
+                    "warning",
+                )
+                expect(ui.notify).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i), "warning")
             })
         } finally {
             warn.mockRestore()
@@ -4874,13 +4896,14 @@ describe("pi hooks loader", () => {
         try {
             const { pi, handlers } = createExtensionApiDouble()
             setup(pi)
+            const ui = createUiDouble()
 
             const sessionStart = getSessionStartHandler(handlers)
             const beforeAgentStart = getBeforeAgentStartHandler(handlers)
 
             await sessionStart?.(
                 { type: "session_start", reason: "startup" },
-                createExtensionContext(canonicalProjectDir),
+                createExtensionContext(canonicalProjectDir, { ui }),
             )
 
             await expect(
@@ -4891,12 +4914,15 @@ describe("pi hooks loader", () => {
                         systemPrompt: "You are Pi.",
                         systemPromptOptions: { cwd: canonicalProjectDir },
                     },
-                    createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
+                    createExtensionContext(join(canonicalProjectDir, "missing-cwd"), { ui }),
                 ),
             ).resolves.toBeUndefined()
             await vi.waitFor(() => {
-                expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
-                expect(warn).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i))
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Hook command failed before completion"),
+                    "warning",
+                )
+                expect(ui.notify).toHaveBeenCalledWith(expect.stringMatching(/ENOENT|spawn/i), "warning")
             })
         } finally {
             warn.mockRestore()
@@ -5403,13 +5429,14 @@ describe("pi hooks loader", () => {
         try {
             const { pi, handlers } = createExtensionApiDouble()
             setup(pi)
+            const ui = createUiDouble()
 
             const sessionStart = getSessionStartHandler(handlers)
             const input = getInputHandler(handlers)
 
             await sessionStart?.(
                 { type: "session_start", reason: "startup" },
-                createExtensionContext(canonicalProjectDir),
+                createExtensionContext(canonicalProjectDir, { ui }),
             )
 
             await expect(
@@ -5420,10 +5447,13 @@ describe("pi hooks loader", () => {
                         source: "interactive",
                         streamingBehavior: "followUp",
                     },
-                    createExtensionContext(join(canonicalProjectDir, "missing-cwd")),
+                    createExtensionContext(join(canonicalProjectDir, "missing-cwd"), { ui }),
                 ),
             ).resolves.toEqual({ action: "continue" })
-            expect(warn).toHaveBeenCalledWith(expect.stringContaining("Hook command failed before completion"))
+            expect(ui.notify).toHaveBeenCalledWith(
+                expect.stringContaining("Hook command failed before completion"),
+                "warning",
+            )
         } finally {
             warn.mockRestore()
             process.env.HOME = previousHome
@@ -7688,7 +7718,14 @@ describe("pi hooks loader", () => {
                 )
 
                 await vi.waitFor(() => {
-                    expect(ui.notify).toHaveBeenCalledTimes(1)
+                    expect(ui.notify).toHaveBeenCalledWith(
+                        expect.stringContaining('Hook command failed with exit code 3: node -e "process.exit(3)"'),
+                        "warning",
+                    )
+                    expect(ui.notify).toHaveBeenCalledWith(
+                        expect.stringContaining("Hook tool_call failed: nonzero_exit"),
+                        "warning",
+                    )
                 })
             } finally {
                 process.env.HOME = previousHome
@@ -7758,7 +7795,11 @@ describe("pi hooks loader", () => {
                     { timeout: 4000 },
                 )
 
-                expect(ui.notify).not.toHaveBeenCalled()
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Hook command timed out after 1s"),
+                    "warning",
+                )
+                expect(ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Hook tool_call stopped"), "warning")
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
@@ -7818,7 +7859,14 @@ describe("pi hooks loader", () => {
                     { timeout: 4000 },
                 )
 
-                expect(ui.notify).toHaveBeenCalledTimes(1)
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stdout for tool_call"),
+                    "warning",
+                )
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Hook tool_call failed: invalid_stdout"),
+                    "warning",
+                )
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
@@ -7871,7 +7919,14 @@ describe("pi hooks loader", () => {
                     { timeout: 4000 },
                 )
 
-                expect(ui.notify).not.toHaveBeenCalled()
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining('Hook command failed with exit code 2: node -e "process.exit(2)"'),
+                    "warning",
+                )
+                expect(ui.notify).not.toHaveBeenCalledWith(
+                    expect.stringContaining("Hook turn_start failed: nonzero_exit"),
+                    "warning",
+                )
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)

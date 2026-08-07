@@ -1,169 +1,93 @@
-# Pi extension operational surface for hook observability
+# Pi extension UI and operational surfaces
 
 ## Question
 
-What operator-facing surfaces does Pi already expose to extensions, and how do those constrain a first Pi Hooks operational loop?
+What operator-facing surfaces does Pi expose to extensions, based on inspected Pi documentation, bundled examples, and installed package source?
 
 ## Sources inspected
 
-- `node_modules/@earendil-works/pi-coding-agent/docs/extensions.md`
-- `node_modules/@earendil-works/pi-coding-agent/docs/rpc.md`
-- `node_modules/@earendil-works/pi-coding-agent/examples/extensions/status-line.ts`
-- `node_modules/@earendil-works/pi-coding-agent/examples/extensions/working-indicator.ts`
-- `node_modules/@earendil-works/pi-coding-agent/examples/extensions/README.md`
-- `src/index.ts`
+- `/opt/homebrew/Cellar/pi-coding-agent/0.83.0/libexec/lib/node_modules/@earendil-works/pi-coding-agent/docs/extensions.md`
+- `/opt/homebrew/Cellar/pi-coding-agent/0.83.0/libexec/lib/node_modules/@earendil-works/pi-coding-agent/docs/tui.md`
+- `/opt/homebrew/Cellar/pi-coding-agent/0.83.0/libexec/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/status-line.ts`
+- `/opt/homebrew/Cellar/pi-coding-agent/0.83.0/libexec/lib/node_modules/@earendil-works/pi-coding-agent/examples/extensions/ssh.ts`
 
-## What Pi already gives extensions
+## Findings
 
-### 1. Footer status text
+### 1. Extensions can set footer/status text
 
-Pi exposes `ctx.ui.setStatus(key, text)` for persistent footer status.
+The inspected Pi extension docs expose a UI status API via `ctx.ui.setStatus(key, text)`.
 
-The docs and examples show:
+This provides:
 
-- keyed ownership (`setStatus("my-ext", ...)`)
-- clearing with `undefined`
-- updates from ordinary event handlers such as `session_start`, `turn_start`, `turn_end`, and `model_select`
+- a keyed status entry
+- text shown in the footer/status area
+- explicit clearing by setting an empty string
 
-This is the lightest-weight built-in operator surface for “a hook is running” or “hook run failed”.
+The bundled `examples/extensions/status-line.ts` demonstrates this surface in use.
 
-### 2. Widgets
+### 2. Extensions can render richer footer widgets
 
-Pi exposes `ctx.ui.setWidget(key, widget)` for richer persistent visual state above or below the editor.
+The inspected Pi extension docs also expose `ctx.ui.setWidget(key, widget)`.
 
-Docs/examples show it can render:
+This allows an extension to replace a plain status line entry with a structured widget in the same general footer/status area.
 
-- simple string arrays
-- custom TUI components
-- above-editor or below-editor placement
+### 3. Extensions can send transient notifications
 
-This is a viable second-step inspection surface for recent hook runs or latest failures.
+The inspected Pi extension docs expose `ctx.ui.notify(text, level)`.
 
-### 3. Notifications
+The documented/observed levels include:
 
-Pi exposes `ctx.ui.notify(text, level)` for transient notices.
+- `info`
+- `warning`
+- `error`
 
-That is useful for exceptional hook outcomes such as:
+This is a built-in operator-facing notification surface distinct from the footer/status line.
 
-- timeout
-- non-zero exit
-- malformed stdout on a semantic hook
+### 4. Extensions can register slash commands
 
-But it is too noisy to use for every routine hook completion.
+The inspected Pi extension docs expose `pi.registerCommand(...)`.
 
-### 4. Commands
+This gives extensions a command entry point that can be invoked from Pi.
 
-Pi exposes `pi.registerCommand(...)` for extension-owned commands.
+### 5. Extensions can control a working indicator
 
-That means Pi Hooks can add an inspection surface such as:
+The inspected Pi extension docs expose `ctx.ui.setWorkingIndicator(...)`.
 
-- `/hooks`
-- `/hooks recent`
-- `/hooks failures`
+This is a separate built-in UI primitive for marking work/progress state.
 
-without needing Pi core changes.
+### 6. Extensions have session-scoped event handlers and context
 
-### 5. Streaming working indicator customization
+The inspected extension docs and examples show event-driven extension hooks such as session and message lifecycle handlers, with a `ctx` object carrying UI access for the current extension context.
 
-Pi exposes `ctx.ui.setWorkingIndicator(...)`.
+### 7. Hidden extension-authored assistant steering/messages are a separate surface
 
-This controls the agent-streaming spinner, not arbitrary sub-process job telemetry. It may still be useful later, but it is not a substitute for hook-specific status state.
+The inspected extension docs describe internal/hidden assistant steering surfaces such as `deliverAs: "steer"` for injected messages. This is separate from footer status and transient notifications.
 
-### 6. Session-scoped extension state is normal
+## Non-findings from the inspected sources
 
-Pi docs explicitly support session-scoped runtime state that is created on `session_start` and cleaned up on `session_shutdown`.
+The inspected docs/examples did **not** clearly document the following as first-class extension primitives:
 
-That matches Pi Hooks’ current runtime shape and gives a natural home for:
+### 1. A built-in task/run timeline for extension-owned subprocesses
 
-- active hook runs
-- recent hook runs buffer
-- current aggregated status text
+No clearly documented built-in extension API was found for showing a persistent per-task timeline/history of extension-managed subprocesses or runs.
 
-## What Pi does not obviously give extensions
+### 2. A documented custom event bus for extension-defined operator events
 
-### 1. No documented extension-defined event stream into RPC clients
+No clearly documented extension API was found for emitting arbitrary custom UI events into Pi's native event stream.
 
-`rpc.md` documents built-in streamed events such as:
+### 3. A documented dedicated hook-observability framework
 
-- `agent_start`
-- `turn_start`
-- `message_update`
-- `tool_execution_*`
-- `extension_error`
-
-But the docs shown do not describe an API for extensions to emit arbitrary custom protocol events like `hook_started` / `hook_completed` into that stream.
-
-So the safest assumption is:
-
-- extension-owned hook telemetry can be shown in TUI now
-- RPC inspection likely needs to happen through commands or existing UI surfaces unless deeper Pi support is found later
-
-### 2. No built-in hook-run timeline primitive
-
-Pi offers status lines, widgets, notifications, and commands, but not a first-class generic “background task timeline” primitive for extension subprocesses.
-
-So Pi Hooks must own its own run model and presentation logic.
-
-## What Pi Hooks already has locally
-
-From `src/index.ts`, Pi Hooks already has the runtime substrate needed to back an operational loop:
-
-- `LoadedHook.statusMessage?: string`
-- `activeHookExecutions: Set<ActiveHookExecution>`
-- cancellation reasons: `abort | shutdown | timeout`
-- a single child-process runner `runCommandHook(...)`
-- stdout/stderr capture
-- semantic vs observe-only dispatch seams
-- `session_shutdown` cleanup path
-
-But the current tracked state is process-control-only, not operator-facing:
-
-- `activeHookExecutions` does not carry ids, source metadata, timestamps, or entries
-- warnings go straight to `console.warn(...)`
-- `statusMessage` is loaded but never surfaced via `ctx.ui.setStatus(...)`
-- observe-only hooks are operationally invisible except for late warnings
-
-## Implications for Pi Hooks
-
-### Best first UI surface: footer status
-
-Because Pi already has keyed footer status and examples for event-driven updates, the lowest-risk first operational surface is:
-
-- aggregate active hook runs
-- render one compact status line
-- clear it when no runs are active
-
-### Best first inspection surface: command, not protocol
-
-Because Pi definitely supports commands and does not obviously support arbitrary extension event streaming, the safest first inspection surface is an extension command such as `/hooks`.
-
-### Widgets are a second-step enhancement
-
-A widget can later show:
-
-- most recent failures
-- currently active hooks
-- last N runs with status/duration
-
-But it is not necessary for the first proving slice.
-
-### Notifications should be exceptional only
-
-`ctx.ui.notify(...)` should likely be reserved for:
-
-- hook timeout
-- hook spawn/exit failure
-- malformed semantic stdout on a semantic event
-
-Routine successful completions should not notify.
+No clearly documented Pi-native subsystem was found specifically for hook/run observability as a distinct extension feature area.
 
 ## Bottom line
 
-Pi already gives enough extension-owned UI to build a useful first operational loop for Pi Hooks:
+From the inspected Pi docs/examples, the main documented operator-facing extension surfaces are:
 
-- `setStatus` for “running now”
-- `registerCommand` for inspection
-- optional `setWidget` for richer recent-run display
-- `notify` for exceptional failures
+- footer/status text via `ctx.ui.setStatus(...)`
+- richer footer widgets via `ctx.ui.setWidget(...)`
+- transient notifications via `ctx.ui.notify(...)`
+- command entry points via `pi.registerCommand(...)`
+- working/progress indication via `ctx.ui.setWorkingIndicator(...)`
+- hidden/internal steering-style message delivery as a separate surface
 
-The missing piece is not Pi UI capability. The missing piece is an internal Pi Hooks hook-run model that those surfaces can read from.
+The inspected sources do not clearly document a first-class built-in timeline/event-stream UI for extension-owned operational telemetry.

@@ -378,8 +378,10 @@ type HookStatusSink = {
     setStatus(key: string, text: string | undefined): void
 }
 
+type HookNotifyLevel = "info" | "warning" | "error"
+
 type HookNotifySink = {
-    notify(message: string, options?: unknown): void
+    notify(message: string, level?: HookNotifyLevel): void
 }
 
 type HookRunRecord = {
@@ -571,7 +573,9 @@ const validateHookStdoutEnvelope = compileJsonSchemaValidator(hookStdoutEnvelope
 const allowedEventNames = loadAllowedEventNames(hooksSchema)
 const validateHookStdoutOutputByEvent = compileHookStdoutOutputValidators(allowedEventNames)
 
-export async function loadUserHooksRegistry(options: { homeDir?: string } = {}): Promise<HookRegistry> {
+export async function loadUserHooksRegistry(
+    options: { homeDir?: string; notifyUi?: unknown } = {},
+): Promise<HookRegistry> {
     const homeDir = options.homeDir ?? homedir()
     const sourcePath = join(homeDir, ".pi", "hooks.json")
 
@@ -579,11 +583,13 @@ export async function loadUserHooksRegistry(options: { homeDir?: string } = {}):
         return EMPTY_REGISTRY
     }
 
-    const loadedFile = await tryLoadDiscoveredHooksFile(sourcePath)
+    const loadedFile = await tryLoadDiscoveredHooksFile(sourcePath, { notifyUi: options.notifyUi })
     return loadedFile === undefined ? EMPTY_REGISTRY : { files: [loadedFile] }
 }
 
-export async function loadHooksRegistry(options: { homeDir?: string; cwd?: string } = {}): Promise<HookRegistry> {
+export async function loadHooksRegistry(
+    options: { homeDir?: string; cwd?: string; notifyUi?: unknown } = {},
+): Promise<HookRegistry> {
     const homeDir = options.homeDir ?? homedir()
     const cwd = resolve(options.cwd ?? process.cwd())
     const sourcePaths = await discoverHookFilePaths({ homeDir, cwd })
@@ -594,7 +600,7 @@ export async function loadHooksRegistry(options: { homeDir?: string; cwd?: strin
             continue
         }
 
-        const loadedFile = await tryLoadDiscoveredHooksFile(sourcePath)
+        const loadedFile = await tryLoadDiscoveredHooksFile(sourcePath, { notifyUi: options.notifyUi })
         if (loadedFile !== undefined) {
             files.push(loadedFile)
         }
@@ -651,7 +657,7 @@ export default function setup(pi: ExtensionAPI) {
     }
 
     pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
-        activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd })
+        activeRegistry = await loadHooksRegistry({ cwd: ctx.cwd, notifyUi: ctx.ui })
         activeBeforeAgentStartSlots = compileBeforeAgentStartHookSlots(activeRegistry)
         ensureBeforeAgentStartSlotHandlers(activeBeforeAgentStartSlots.length)
         finalizedHookRuns.clear()
@@ -663,7 +669,7 @@ export default function setup(pi: ExtensionAPI) {
     pi.on(
         "project_trust",
         async (event: ProjectTrustEvent, ctx: ProjectTrustContext): Promise<ProjectTrustEventResult> => {
-            const registry = await loadUserHooksRegistry()
+            const registry = await loadUserHooksRegistry({ notifyUi: ctx.ui })
             dispatchProjectTrustHooks(event, ctx, registry)
             return { trusted: "undecided" }
         },
@@ -852,25 +858,28 @@ function listAncestorDirectories(cwd: string) {
     return directories
 }
 
-async function loadHooksFile(sourcePath: string): Promise<LoadedHooksFile> {
+async function loadHooksFile(sourcePath: string, options: { notifyUi?: unknown } = {}): Promise<LoadedHooksFile> {
     const parsed = parseJsonObject(await readFile(sourcePath, "utf8"), sourcePath)
     validateParsedHooksFile(parsed, sourcePath)
 
     return {
         sourcePath,
-        events: normalizeHooksFile(parsed, sourcePath),
+        events: normalizeHooksFile(parsed, sourcePath, { notifyUi: options.notifyUi }),
     }
 }
 
-async function tryLoadDiscoveredHooksFile(sourcePath: string): Promise<LoadedHooksFile | undefined> {
+async function tryLoadDiscoveredHooksFile(
+    sourcePath: string,
+    options: { notifyUi?: unknown } = {},
+): Promise<LoadedHooksFile | undefined> {
     try {
-        return await loadHooksFile(sourcePath)
+        return await loadHooksFile(sourcePath, options)
     } catch (error) {
         if (!isSkippableDiscoveredFileError(error, sourcePath)) {
             throw error
         }
 
-        console.warn((error as Error).message)
+        reportWarning((error as Error).message, { notifyUi: options.notifyUi })
         return undefined
     }
 }
@@ -968,7 +977,7 @@ function isSkippableDiscoveredFileError(error: unknown, sourcePath: string) {
     return error instanceof Error && error.message.startsWith(`Invalid hooks.json at ${sourcePath}:`)
 }
 
-function normalizeHooksFile(parsed: JsonObject, sourcePath: string) {
+function normalizeHooksFile(parsed: JsonObject, sourcePath: string, options: { notifyUi?: unknown } = {}) {
     const hooks = parsed.hooks
     if (!isJsonObject(hooks)) {
         throw new Error("Invalid hooks.json: hooks must be an object")
@@ -976,7 +985,7 @@ function normalizeHooksFile(parsed: JsonObject, sourcePath: string) {
 
     return Object.entries(hooks).map(([eventName, matcherGroups]) => ({
         eventName: normalizeEventName(eventName),
-        matcherGroups: normalizeMatcherGroups(matcherGroups, { eventName, sourcePath }),
+        matcherGroups: normalizeMatcherGroups(matcherGroups, { eventName, sourcePath, notifyUi: options.notifyUi }),
     }))
 }
 
@@ -990,7 +999,7 @@ function normalizeEventName(eventName: string) {
 
 function normalizeMatcherGroups(
     value: JsonValue,
-    context: { eventName: string; sourcePath: string },
+    context: { eventName: string; sourcePath: string; notifyUi?: unknown },
 ): LoadedMatcherGroup[] {
     if (!Array.isArray(value)) {
         throw new Error("Invalid hooks.json: event registrations must be arrays")
@@ -1015,8 +1024,9 @@ function normalizeMatcherGroups(
                 hooks: (matcherGroup.hooks as JsonValue[]).map(normalizeHook),
             })
         } catch (error) {
-            console.warn(
+            reportWarning(
                 `Invalid matcher in hooks.json at ${context.sourcePath} for ${context.eventName}: ${matcher ?? "<omitted>"} (${(error as Error).message})`,
+                { notifyUi: context.notifyUi },
             )
         }
     }
@@ -1026,7 +1036,7 @@ function normalizeMatcherGroups(
 
 function normalizeMatcherForEvent(
     matcher: string | undefined,
-    context: { eventName: string; sourcePath: string },
+    context: { eventName: string; sourcePath: string; notifyUi?: unknown },
 ): LoadedMatcher {
     if (!isMatchAllOnlyEvent(context.eventName)) {
         return normalizeMatcher(matcher)
@@ -1036,8 +1046,9 @@ function normalizeMatcherForEvent(
         return { kind: "all" }
     }
 
-    console.warn(
+    reportWarning(
         `Ignoring matcher in hooks.json at ${context.sourcePath} for ${context.eventName}: ${matcher} (event is match-all-only)`,
+        { notifyUi: context.notifyUi },
     )
     return { kind: "all" }
 }
@@ -1131,6 +1142,38 @@ function getHookNotifySink(value: unknown): HookNotifySink | undefined {
     return typeof value.notify === "function" ? (value as HookNotifySink) : undefined
 }
 
+function isStaleContextError(error: unknown) {
+    return error instanceof Error && /stale/i.test(error.message)
+}
+
+function safeNotify(notifyUi: unknown, message: string, level: HookNotifyLevel = "info") {
+    const notifySink = getHookNotifySink(notifyUi)
+    if (notifySink === undefined) {
+        return false
+    }
+
+    try {
+        notifySink.notify(message, level)
+        return true
+    } catch (error) {
+        if (!isStaleContextError(error)) {
+            throw error
+        }
+
+        return false
+    }
+}
+
+function reportWarning(message: string, options: { notifyUi?: unknown; level?: HookNotifyLevel } = {}) {
+    safeNotify(options.notifyUi ?? lastHookNotifySink, message, options.level ?? "warning")
+}
+
+function reportHookCommandFailureBeforeCompletion(notifyUi: unknown, command: string, error: unknown) {
+    reportWarning(`Hook command failed before completion: ${command} (${toErrorMessage(error)})`, {
+        notifyUi,
+    })
+}
+
 function startHookRun(options: { eventName: string; statusMessage: string | undefined; statusUi?: unknown }) {
     const statusSink = getHookStatusSink(options.statusUi)
     if (statusSink !== undefined) {
@@ -1202,7 +1245,7 @@ function notifyOnFinalize(run: FinalizedHookRun) {
     )
 
     if (run.status === "blocked") {
-        lastHookNotifySink.notify(`Hook ${run.eventName} blocked`)
+        safeNotify(lastHookNotifySink, `Hook ${run.eventName} blocked`, "warning")
         return
     }
 
@@ -1220,7 +1263,11 @@ function notifyOnFinalize(run: FinalizedHookRun) {
         hookInvalidStdoutNotified.add(run.eventName)
     }
 
-    lastHookNotifySink.notify(`Hook ${run.eventName} ${run.status}${run.reason === undefined ? "" : `: ${run.reason}`}`)
+    safeNotify(
+        lastHookNotifySink,
+        `Hook ${run.eventName} ${run.status}${run.reason === undefined ? "" : `: ${run.reason}`}`,
+        "warning",
+    )
 }
 
 export function getFinalizedHookRuns(): FinalizedHookRun[] {
@@ -1390,9 +1437,7 @@ function dispatchProjectTrustHooks(event: ProjectTrustEvent, ctx: ProjectTrustCo
                         }),
                         statusUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -1426,9 +1471,7 @@ function dispatchModelSelectHooks(event: ModelSelectEvent, ctx: ExtensionContext
                         abortSignal: getHookAbortSignal(event, ctx),
                         statusUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -1462,9 +1505,7 @@ function dispatchThinkingLevelSelectHooks(event: ThinkingLevelSelectEvent, ctx: 
                         abortSignal: getHookAbortSignal(event, ctx),
                         statusUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -1591,9 +1632,7 @@ function dispatchReasonMatchedHooks(
                         abortSignal: getHookAbortSignal(event, ctx),
                         statusUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -1627,9 +1666,7 @@ function dispatchMatchAllHooks(
                         abortSignal: getHookAbortSignal(event, ctx),
                         statusUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -1670,7 +1707,7 @@ async function dispatchBeforeAgentStartHookSlot(
             statusUi: ctx.ui,
         })
     } catch (error) {
-        console.warn(`Hook command failed before completion: ${slot.hook.command} (${toErrorMessage(error)})`)
+        reportHookCommandFailureBeforeCompletion(ctx.ui, slot.hook.command, error)
         return undefined
     }
 
@@ -1733,9 +1770,7 @@ async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Pro
                             },
                         })
                     } catch (error) {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                         continue
                     }
 
@@ -1809,9 +1844,7 @@ function dispatchTextMatchedHooks(options: {
                             return
                         }
 
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(options.ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -1870,9 +1903,7 @@ async function dispatchToolCallHooks(
                             },
                         })
                     } catch (error) {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                         continue
                     }
 
@@ -1942,9 +1973,7 @@ async function dispatchToolResultHooks(
                             statusUi: ctx.ui,
                         })
                     } catch (error) {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                         continue
                     }
 
@@ -2025,9 +2054,7 @@ function dispatchToolNamedHooks(
                         abortSignal: getHookAbortSignal(event, ctx),
                         statusUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        console.warn(
-                            `Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`,
-                        )
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
                     })
                 }
             }
@@ -2178,7 +2205,7 @@ async function runCommandHook(options: {
 
         if (activeExecution.cancellationReason === "timeout") {
             if (reportFailures) {
-                console.warn(
+                reportWarning(
                     `Hook command timed out after ${options.hook.timeout}s: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
                 )
             }
@@ -2188,7 +2215,7 @@ async function runCommandHook(options: {
 
         if (activeExecution.cancellationReason === "abort") {
             if (reportFailures) {
-                console.warn(`Hook command aborted: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`)
+                reportWarning(`Hook command aborted: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`)
             }
             finalization = { status: "stopped", reason: "abort", entries: [] }
             return
@@ -2202,7 +2229,7 @@ async function runCommandHook(options: {
         if (exitCode === 0) {
             const parsedStdout = parseHookStdout({ stdout, eventName: options.payload.event })
             if (parsedStdout.kind === "invalid") {
-                console.warn(`${parsedStdout.warning}\nstdout: ${stdout}\nstderr: ${stderr}`)
+                reportWarning(`${parsedStdout.warning}\nstdout: ${stdout}\nstderr: ${stderr}`)
                 finalization = {
                     status: "failed",
                     reason: "invalid_stdout",
@@ -2227,7 +2254,7 @@ async function runCommandHook(options: {
                     return parsedStdout.envelope
                 }
 
-                console.warn(
+                reportWarning(
                     `Ignoring hook stdout for ${options.payload.event}: semantic output is not supported yet\nstdout: ${stdout}\nstderr: ${stderr}`,
                 )
                 return parsedStdout.envelope
@@ -2237,7 +2264,7 @@ async function runCommandHook(options: {
         }
 
         if (reportFailures) {
-            console.warn(
+            reportWarning(
                 `Hook command failed with exit code ${exitCode ?? "unknown"}: ${options.hook.command}\nstdout: ${stdout}\nstderr: ${stderr}`,
             )
         }

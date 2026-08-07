@@ -125,6 +125,7 @@ This means the operator-facing visible loop should be:
 - active runs update one compact footer status
 - the footer clears when no hooks are active
 - exceptional failures may still notify, but notifications are not treated as part of the visible hook UI surface
+- operator-visible warnings/failures must use Pi-native UI notification surfaces rather than raw console warnings
 
 ## #5: How should `statusMessage` behave in Pi Hooks?
 
@@ -273,6 +274,10 @@ Use current Pi extension surfaces:
 
 - `ctx.ui.setStatus(...)` for the compact active-run footer status
 - `ctx.ui.notify(...)` only for notable failures/timeouts
+
+Constraint:
+
+- raw console warnings are not part of the operator-facing hook surface; operator-visible hook warnings should go through Pi-native UI notification handling
 
 Do not block this work on Pi core protocol changes.
 
