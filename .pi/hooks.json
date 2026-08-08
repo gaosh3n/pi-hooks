@@ -1,19 +1,19 @@
 {
     "$schema": "https://raw.githubusercontent.com/gaosh3n/pi-hooks/main/pi-hooks.schema.json",
     "hooks": {
-        "tool_result": [
+        "tool_call": [
             {
                 "matcher": "bash|edit|write",
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash .pi/hooks/tool-result-oxfmt.sh",
-                        "statusMessage": "oxfmt: checking written files ..."
+                        "command": "bash .pi/hooks/tool-call-oxfmt.sh",
+                        "statusMessage": "oxfmt: checking proposed write ..."
                     },
                     {
                         "type": "command",
-                        "command": "bash .pi/hooks/tool-result-oxlint.sh",
-                        "statusMessage": "oxlint: checking written files ..."
+                        "command": "bash .pi/hooks/tool-call-oxlint.sh",
+                        "statusMessage": "oxlint: checking proposed write ..."
                     }
                 ]
             }
