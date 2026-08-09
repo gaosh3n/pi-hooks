@@ -105,26 +105,26 @@ What operator-facing visible UI surface should Pi Hooks have?
 
 Resolved.
 
-The visible UI surface should be exactly one compact footer status via `ctx.ui.setStatus(...)`.
+The visible hook UI surface should be Pi-native notifications delivered through the shared `safeNotify(...)` path.
 
 Not part of the visible UI surface:
 
 - widgets
-- routine notifications
+- a persistent footer status for hook runs
 - a second visible panel for hook history
 - custom Pi-core protocol work
 
 Why:
 
-- Pi already has a simple keyed footer-status API that fits active hook-run aggregation well
-- one compact footer status matches the desired operator experience
+- one notification delivery path keeps configured messages and notable failures consistent
+- `safeNotify(...)` already handles missing and stale UI contexts
 - richer visibility can stay non-visual and command-driven if needed later
 
 This means the operator-facing visible loop should be:
 
-- active runs update one compact footer status
-- the footer clears when no hooks are active
-- exceptional failures may still notify, but notifications are not treated as part of the visible hook UI surface
+- a configured `statusMessage` emits one informational notification when its hook starts
+- notable failures continue to use the same notification path
+- routine completion remains in run state only
 - operator-visible warnings/failures must use Pi-native UI notification surfaces rather than raw console warnings
 
 ## #5: How should `statusMessage` behave in Pi Hooks?
@@ -134,38 +134,34 @@ Type: Discuss
 
 ### Question
 
-Pi Hooks already loads `statusMessage` from config, but does not surface it. What exact rules should determine when it appears, how multiple active hooks collapse, and when it clears?
+Pi Hooks already loads `statusMessage` from config. What exact notification rules should determine when it appears and how concurrent hooks are handled?
 
 ### Answer
 
 Resolved.
 
-`statusMessage` should be config-owned, active-run-only, and aggregated by Pi Hooks rather than emitted by hook stdout.
+`statusMessage` is config-owned and emitted through `safeNotify(...)` as a start notification rather than rendered as active-run state.
 
 Rules:
 
-- only active hook runs participate
-- sort active runs by `(startedAt, displayOrder, id)` for deterministic collapse
-- if there are no active runs, clear the status with `ctx.ui.setStatus(key, undefined)`
-- if there is exactly one active run:
-    - show its configured `statusMessage` when present
-    - otherwise show a Pi-owned fallback like `Running <eventName> hook`
-- if there are multiple active runs:
-    - show a compact aggregate like `Running 3 hooks: Loading session notes (+2 more)`
-    - use the first active run’s configured `statusMessage` when present as the lead label
-    - otherwise use a Pi-owned fallback label derived from the first active run’s event
+- when a selected hook has a configured `statusMessage`, emit it once when the hook run starts
+- use the informational notification level
+- emit each configured message independently; do not aggregate concurrent start notifications
+- hooks without `statusMessage` do not emit a replacement fallback notification
+- stale or unavailable UI contexts are handled by `safeNotify(...)`
 
 Non-rules:
 
-- do not let hooks set transient status text through stdout
-- do not notify on every status change
-- do not keep completed statuses pinned in the footer; completed history belongs in the run buffer and debug-oriented internal inspection paths if we need them later
+- do not render `statusMessage` through `ctx.ui.setStatus(...)`
+- do not notify again when a run completes
+- do not treat completed notifications as persistent run state; completed history belongs in the run buffer and debug-oriented internal inspection paths if we need them later
+- do not let hooks set transient notification text through stdout
 
 Why:
 
-- this keeps status text trusted and predictable
-- it reuses the already-loaded `statusMessage` field
-- it avoids footer flicker while still giving the operator immediate visibility that hooks are in flight
+- this gives configured messages and notable failures one delivery seam
+- it preserves the existing configuration key while changing only its UI delivery semantics
+- it avoids inventing aggregation and clearing behavior for an inherently transient notification surface
 
 ## #6: How should fire-and-forget observe-only hooks appear operationally?
 
@@ -189,7 +185,7 @@ Model:
 - mark it `running` while the subprocess is in flight
 - finalize it asynchronously when the subprocess exits
 - attach warnings/errors/ignored-stdout diagnostics to that run record
-- include those runs in the active footer status while they are still live
+- emit a configured `statusMessage` once at start through `safeNotify(...)`
 - do not surface routine completion in visible UI; keep it in run state only
 - use notifications only for notable failures such as timeout or repeated malformed semantic-looking stdout on important seams; this threshold is a **notification-layer display gate**, not a classification-layer suppression — the classifier (#25 decision map) always records all classifications (`failed`/`blocked`/`stopped`), and the notifier decides what to surface. `stopped` runs (timeout/abort/shutdown) are non-failures and never notify
 
@@ -240,7 +236,7 @@ Why:
 
 - Pi Hooks already has event-specific semantic state machines for `input`, `before_agent_start`, `tool_call`, and `tool_result`
 - those dispatchers already know whether a result was `continue`, `transform`, `handled`, message injection, prompt replacement, input patching, blocking, or result patching
-- duplicating those distinctions into a generic operational record would burden the shared runtime model with event-specific detail that the footer status does not need
+- duplicating those distinctions into a generic operational record would burden the shared runtime model with event-specific detail that the notification surface does not need
 
 Mapping rules:
 
@@ -253,7 +249,7 @@ Mapping rules:
 
 If later debugging needs a little more semantic color, add it as a typed run entry, not as new always-present top-level fields.
 
-This keeps the shared hook-run model lean while staying expressive enough for the compact footer status and notable failure notifications.
+This keeps the shared hook-run model lean while staying expressive enough for start notifications and notable failure notifications.
 
 ## #9: Should hook-run observability stay extension-owned, or do we need Pi core protocol work?
 
@@ -262,7 +258,7 @@ Type: Research
 
 ### Question
 
-Can Pi Hooks deliver a useful operational loop entirely through current extension APIs (`ctx.ui.setStatus`, `notify`), or is there a real need for deeper Pi protocol support?
+Can Pi Hooks deliver a useful operational loop entirely through current extension APIs (`notify`), or is there a real need for deeper Pi protocol support?
 
 ### Answer
 
@@ -270,10 +266,9 @@ Resolved.
 
 For the useful operational loop defined in this map, hook-run observability should stay extension-owned.
 
-Use current Pi extension surfaces:
+Use the current Pi extension surface:
 
-- `ctx.ui.setStatus(...)` for the compact active-run footer status
-- `ctx.ui.notify(...)` only for notable failures/timeouts
+- `ctx.ui.notify(...)` through `safeNotify(...)` for configured start messages and notable failures/timeouts
 
 Constraint:
 
@@ -304,9 +299,9 @@ The smallest shippable slice that proves the architecture is:
 
 1. introduce `HookRunRecord` state for every selected hook
 2. track both awaited semantic hooks and fire-and-forget observe-only hooks through that same model
-3. drive one compact footer status from active runs using `statusMessage`
+3. emit configured `statusMessage` values through `safeNotify(...)` at run start
 4. keep enough internal run state to finalize background runs correctly
-5. reserve notifications for notable failures/timeouts only
+5. use the same notification path for notable failures/timeouts
 
 Deliberately not in the first slice:
 
@@ -320,7 +315,7 @@ Deliberately not in the first slice:
 Why this is the right proving slice:
 
 - it exercises the full architectural seam, including asynchronous observe-only runs
-- it proves the deep module boundary (`HookRunRecord`) is useful to live status aggregation
+- it proves the deep module boundary (`HookRunRecord`) remains useful while UI delivery is centralized separately
 - it is small enough to ship without changing the existing semantic hook contract
 
 Implementation order inside the slice:
@@ -328,7 +323,7 @@ Implementation order inside the slice:
 1. evolve `ActiveHookExecution` into richer run state
 2. centralize run creation/finalization in `runCommandHook(...)`
 3. record entries instead of only warning text
-4. wire active-run aggregation into `ctx.ui.setStatus(...)`
+4. route configured start messages through `safeNotify(...)`
 
 With this ticket resolved, the path to implementation is clear and the decision map is done.
 
@@ -438,7 +433,7 @@ path). Routes:
 - shutdown (operator teardown, per runtime #5) → `stopped`, `reason: "shutdown"`.
 
 No `error` entry on `stopped` (interruption is not a failure; reason is the discriminator). The new
-globals reset #24 added (`activeHookRuns`, `nextHookRunDisplayOrder`, `lastHookStatusSink`) plus
+globals reset #24 added (`activeHookRuns`, `nextHookRunDisplayOrder`) plus
 the new `finalizedHookRuns` store are all cleared on `session_shutdown` per runtime #5 — so a run
 in flight at shutdown is finalized to `stopped`+`reason:shutdown` before/into the clear (the
 runner's `finally` runs first; `cancelActiveHookExecutions("shutdown")` already triggers this).

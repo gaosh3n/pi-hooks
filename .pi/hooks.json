@@ -1,6 +1,18 @@
 {
     "$schema": "https://raw.githubusercontent.com/gaosh3n/pi-hooks/main/pi-hooks.schema.json",
     "hooks": {
+        "session_start": [
+            {
+                "matcher": "startup|reload",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "pi update --extensions 1>&2",
+                        "statusMessage": "pi: updating extensions ..."
+                    }
+                ]
+            }
+        ],
         "tool_call": [
             {
                 "matcher": "bash|edit|write",

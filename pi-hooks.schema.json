@@ -5,9 +5,7 @@
     "description": "Schema for hooks.json files used by Pi Hooks, based on Pi lifecycle events and handlers.",
     "type": "object",
     "additionalProperties": false,
-    "required": [
-        "hooks"
-    ],
+    "required": ["hooks"],
     "properties": {
         "$schema": {
             "type": "string",
@@ -169,9 +167,7 @@
         "matcherGroup": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-                "hooks"
-            ],
+            "required": ["hooks"],
             "properties": {
                 "matcher": {
                     "type": "string",
@@ -190,10 +186,7 @@
         "handler": {
             "type": "object",
             "additionalProperties": false,
-            "required": [
-                "type",
-                "command"
-            ],
+            "required": ["type", "command"],
             "properties": {
                 "type": {
                     "const": "command",
@@ -211,7 +204,7 @@
                 },
                 "statusMessage": {
                     "type": "string",
-                    "description": "Optional status text shown while the handler runs."
+                    "description": "Optional informational notification sent when the handler starts."
                 }
             }
         }

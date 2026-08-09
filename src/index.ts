@@ -374,10 +374,6 @@ type ActiveHookExecution = {
     clearAbortListener: (() => void) | undefined
 }
 
-type HookStatusSink = {
-    setStatus(key: string, text: string | undefined): void
-}
-
 type HookNotifyLevel = "info" | "warning" | "error"
 
 type HookNotifySink = {
@@ -414,7 +410,7 @@ type FinalizedHookRun = {
 }
 
 const HOOK_PROTOCOL_VERSION = 1 as const
-const HOOK_STATUS_KEY = "pi-hooks"
+const SESSION_START_NOTIFICATION_DELAY_MS = 100
 const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
 const emptyHookOutputSchema = {
     type: "object",
@@ -560,7 +556,6 @@ let activeBeforeAgentStartSlots: BeforeAgentStartHookSlot[] = []
 let activeHookExecutions = new Set<ActiveHookExecution>()
 let activeHookRuns = new Map<string, HookRunRecord>()
 let nextHookRunDisplayOrder = 0
-let lastHookStatusSink: HookStatusSink | undefined
 let finalizedHookRuns = new Map<string, FinalizedHookRun>()
 let lastHookNotifySink: HookNotifySink | undefined
 let hookInvalidStdoutCounts = new Map<string, number>()
@@ -772,8 +767,6 @@ export default function setup(pi: ExtensionAPI) {
         finalizedHookRuns.clear()
         hookInvalidStdoutCounts.clear()
         hookInvalidStdoutNotified.clear()
-        renderHookStatus()
-        lastHookStatusSink = undefined
         lastHookNotifySink = undefined
         nextHookRunDisplayOrder = 0
         dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
@@ -1126,14 +1119,6 @@ function dispatchSessionStartHooks(event: SessionStartEvent, ctx: ExtensionConte
     dispatchReasonMatchedHooks("session_start", event, ctx)
 }
 
-function getHookStatusSink(value: unknown): HookStatusSink | undefined {
-    if (typeof value !== "object" || value === null || !("setStatus" in value)) {
-        return undefined
-    }
-
-    return typeof value.setStatus === "function" ? (value as HookStatusSink) : undefined
-}
-
 function getHookNotifySink(value: unknown): HookNotifySink | undefined {
     if (typeof value !== "object" || value === null || !("notify" in value)) {
         return undefined
@@ -1168,19 +1153,14 @@ function reportWarning(message: string, options: { notifyUi?: unknown; level?: H
     safeNotify(options.notifyUi ?? lastHookNotifySink, message, options.level ?? "warning")
 }
 
-function reportHookCommandFailureBeforeCompletion(notifyUi: unknown, command: string, error: unknown) {
-    reportWarning(`Hook command failed before completion: ${command} (${toErrorMessage(error)})`, {
+function reportHookCommandFailureBeforeCompletion(notifyUi: unknown, hook: LoadedHook, error: unknown) {
+    reportWarning(`Hook command failed before completion: ${hook.command} (${toErrorMessage(error)})`, {
         notifyUi,
     })
 }
 
-function startHookRun(options: { eventName: string; statusMessage: string | undefined; statusUi?: unknown }) {
-    const statusSink = getHookStatusSink(options.statusUi)
-    if (statusSink !== undefined) {
-        lastHookStatusSink = statusSink
-    }
-
-    const notifySink = getHookNotifySink(options.statusUi)
+function startHookRun(options: { eventName: string; statusMessage: string | undefined; notifyUi?: unknown }) {
+    const notifySink = getHookNotifySink(options.notifyUi)
     if (notifySink !== undefined) {
         lastHookNotifySink = notifySink
     }
@@ -1188,16 +1168,30 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
     const displayOrder = nextHookRunDisplayOrder
     nextHookRunDisplayOrder += 1
 
+    const startedAt = Date.now()
+    const startNotificationDueAt =
+        options.statusMessage !== undefined && options.eventName === "session_start"
+            ? startedAt + SESSION_START_NOTIFICATION_DELAY_MS
+            : undefined
     const run: HookRunRecord = {
         id: `hook-run-${displayOrder}`,
         eventName: options.eventName,
         statusMessage: options.statusMessage,
-        startedAt: Date.now(),
+        startedAt,
         displayOrder,
     }
 
     activeHookRuns.set(run.id, run)
-    renderHookStatus()
+    const statusMessage = options.statusMessage
+    if (statusMessage !== undefined) {
+        if (startNotificationDueAt !== undefined) {
+            // Pi renders the initial transcript after awaiting session_start handlers.
+            // Defer this chat notification so that startup rendering does not replace it.
+            setTimeout(() => safeNotify(notifySink, statusMessage), SESSION_START_NOTIFICATION_DELAY_MS)
+        } else {
+            safeNotify(notifySink, statusMessage)
+        }
+    }
     return run.id
 }
 
@@ -1224,7 +1218,6 @@ function finishHookRun(
     }
     finalizedHookRuns.set(runId, finalizedRun)
     notifyOnFinalize(finalizedRun)
-    renderHookStatus()
 }
 
 function notifyOnFinalize(run: FinalizedHookRun) {
@@ -1282,44 +1275,6 @@ export function getFinalizedHookRuns(): FinalizedHookRun[] {
 
         return left.id.localeCompare(right.id)
     })
-}
-
-function renderHookStatus() {
-    if (lastHookStatusSink === undefined) {
-        return
-    }
-
-    const activeRuns = [...activeHookRuns.values()].sort((left, right) => {
-        if (left.startedAt !== right.startedAt) {
-            return left.startedAt - right.startedAt
-        }
-
-        if (left.displayOrder !== right.displayOrder) {
-            return left.displayOrder - right.displayOrder
-        }
-
-        return left.id.localeCompare(right.id)
-    })
-
-    if (activeRuns.length === 0) {
-        lastHookStatusSink.setStatus(HOOK_STATUS_KEY, undefined)
-        return
-    }
-
-    if (activeRuns.length === 1) {
-        lastHookStatusSink.setStatus(HOOK_STATUS_KEY, getHookRunStatusLabel(activeRuns[0]))
-        return
-    }
-
-    const leadRun = activeRuns[0]
-    lastHookStatusSink.setStatus(
-        HOOK_STATUS_KEY,
-        `Running ${activeRuns.length} hooks: ${getHookRunStatusLabel(leadRun)} (+${activeRuns.length - 1} more)`,
-    )
-}
-
-function getHookRunStatusLabel(run: HookRunRecord) {
-    return run.statusMessage ?? `Running ${run.eventName} hook`
 }
 
 function cancelActiveHookExecutions(reason: HookCancellationReason) {
@@ -1435,9 +1390,9 @@ function dispatchProjectTrustHooks(event: ProjectTrustEvent, ctx: ProjectTrustCo
                             cwd: ctx.cwd,
                             event,
                         }),
-                        statusUi: ctx.ui,
+                        notifyUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                     })
                 }
             }
@@ -1469,9 +1424,9 @@ function dispatchModelSelectHooks(event: ModelSelectEvent, ctx: ExtensionContext
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
-                        statusUi: ctx.ui,
+                        notifyUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                     })
                 }
             }
@@ -1503,9 +1458,9 @@ function dispatchThinkingLevelSelectHooks(event: ThinkingLevelSelectEvent, ctx: 
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
-                        statusUi: ctx.ui,
+                        notifyUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                     })
                 }
             }
@@ -1630,9 +1585,9 @@ function dispatchReasonMatchedHooks(
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
-                        statusUi: ctx.ui,
+                        notifyUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                     })
                 }
             }
@@ -1664,9 +1619,9 @@ function dispatchMatchAllHooks(
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
-                        statusUi: ctx.ui,
+                        notifyUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                     })
                 }
             }
@@ -1704,10 +1659,10 @@ async function dispatchBeforeAgentStartHookSlot(
             reportFailures: true,
             abortSignal: getHookAbortSignal(event, ctx),
             consumeStdout: true,
-            statusUi: ctx.ui,
+            notifyUi: ctx.ui,
         })
     } catch (error) {
-        reportHookCommandFailureBeforeCompletion(ctx.ui, slot.hook.command, error)
+        reportHookCommandFailureBeforeCompletion(ctx.ui, slot.hook, error)
         return undefined
     }
 
@@ -1759,7 +1714,7 @@ async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Pro
                             reportFailures: true,
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
-                            statusUi: ctx.ui,
+                            notifyUi: ctx.ui,
                             classifyOutput: (envelope) => {
                                 const output = envelope.output as InputHookResult
                                 if (output.action === "handled") {
@@ -1770,7 +1725,7 @@ async function dispatchInputHooks(event: InputEvent, ctx: ExtensionContext): Pro
                             },
                         })
                     } catch (error) {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                         continue
                     }
 
@@ -1838,13 +1793,13 @@ function dispatchTextMatchedHooks(options: {
                         }),
                         reportFailures: options.reportFailures,
                         abortSignal: getHookAbortSignal(options.event, options.ctx),
-                        statusUi: options.ctx.ui,
+                        notifyUi: options.ctx.ui,
                     }).catch((error: unknown) => {
                         if (!options.reportFailures) {
                             return
                         }
 
-                        reportHookCommandFailureBeforeCompletion(options.ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(options.ctx.ui, hook, error)
                     })
                 }
             }
@@ -1889,7 +1844,7 @@ async function dispatchToolCallHooks(
                             reportFailures: true,
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
-                            statusUi: ctx.ui,
+                            notifyUi: ctx.ui,
                             classifyOutput: (envelope) => {
                                 const output = envelope.output as ToolCallHookResult
                                 if ("block" in output) {
@@ -1903,7 +1858,7 @@ async function dispatchToolCallHooks(
                             },
                         })
                     } catch (error) {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                         continue
                     }
 
@@ -1970,10 +1925,10 @@ async function dispatchToolResultHooks(
                             reportFailures: true,
                             abortSignal: getHookAbortSignal(event, ctx),
                             consumeStdout: true,
-                            statusUi: ctx.ui,
+                            notifyUi: ctx.ui,
                         })
                     } catch (error) {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                         continue
                     }
 
@@ -2052,9 +2007,9 @@ function dispatchToolNamedHooks(
                             event,
                         }),
                         abortSignal: getHookAbortSignal(event, ctx),
-                        statusUi: ctx.ui,
+                        notifyUi: ctx.ui,
                     }).catch((error: unknown) => {
-                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook.command, error)
+                        reportHookCommandFailureBeforeCompletion(ctx.ui, hook, error)
                     })
                 }
             }
@@ -2102,13 +2057,13 @@ async function runCommandHook(options: {
     reportFailures?: boolean
     abortSignal?: AbortSignal
     consumeStdout?: boolean
-    statusUi?: unknown
+    notifyUi?: unknown
     classifyOutput?: (envelope: HookStdoutEnvelope) => { status?: HookRunStatus; entries?: HookOutputEntry[] }
 }): Promise<HookStdoutEnvelope | undefined> {
     const hookRunId = startHookRun({
         eventName: options.payload.event,
         statusMessage: options.hook.statusMessage,
-        statusUi: options.statusUi,
+        notifyUi: options.notifyUi,
     })
     const child = spawn(options.hook.command, {
         cwd: options.cwd,

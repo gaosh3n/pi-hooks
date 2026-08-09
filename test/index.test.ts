@@ -500,7 +500,6 @@ function createDelayedStdoutHookCommand(stdout: string, delayMs: number) {
 
 function createUiDouble() {
     return {
-        setStatus: vi.fn(),
         notify: vi.fn((message: string) => {
             console.warn(message)
         }),
@@ -886,7 +885,56 @@ describe("pi hooks loader", () => {
         }
     })
 
-    it("shows a configured footer status while an observe-only hook is running and clears it after completion", async () => {
+    it("ignores stale UI errors from a configured start notification", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            hooks: [{ type: "command", command: "true", statusMessage: "Loading session hooks" }],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+            const ui = createUiDouble()
+            ui.notify.mockImplementation(() => {
+                throw new Error("stale UI context")
+            })
+            const sessionStart = getSessionStartHandler(handlers)
+
+            await expect(
+                sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui }),
+                ),
+            ).resolves.toBeUndefined()
+            await vi.waitFor(() => {
+                expect(getFinalizedHookRuns()).toHaveLength(1)
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("defers a session_start notification until after startup rendering", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const startedPath = join(projectDir, "session-started.txt")
@@ -934,20 +982,20 @@ describe("pi hooks loader", () => {
                 createExtensionContext(canonicalProjectDir, { ui }),
             )
 
+            expect(ui.notify).not.toHaveBeenCalled()
             await vi.waitFor(() => {
-                expect(ui.setStatus).toHaveBeenCalledWith("pi-hooks", "Loading session hooks")
+                expect(ui.notify).toHaveBeenCalledWith("Loading session hooks", "info")
             })
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("completed")
             })
-            expect(ui.setStatus).toHaveBeenLastCalledWith("pi-hooks", undefined)
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
     })
 
-    it("collapses multiple live hooks into one deterministic footer status", async () => {
+    it("sends configured start notifications independently for concurrent hooks", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const firstStartedPath = join(projectDir, "session-start-first.txt")
@@ -1006,23 +1054,19 @@ describe("pi hooks loader", () => {
             )
 
             await vi.waitFor(() => {
-                expect(ui.setStatus).toHaveBeenCalledWith(
-                    "pi-hooks",
-                    "Running 2 hooks: Loading session hooks (+1 more)",
-                )
+                expect(ui.notify).toHaveBeenCalledWith("Loading session hooks", "info")
             })
             await vi.waitFor(async () => {
                 await expect(readFile(firstResultPath, "utf8")).resolves.toBe("completed")
                 await expect(readFile(secondResultPath, "utf8")).resolves.toBe("completed")
             })
-            expect(ui.setStatus).toHaveBeenLastCalledWith("pi-hooks", undefined)
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
     })
 
-    it("shows the fallback footer status while an awaited semantic hook runs", async () => {
+    it("does not notify when an awaited semantic hook has no statusMessage", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const stdout = JSON.stringify({
@@ -1079,20 +1123,15 @@ describe("pi hooks loader", () => {
 
             const resultPromise = toolCall?.(event, createExtensionContext(canonicalProjectDir, { ui }))
 
-            await vi.waitFor(() => {
-                expect(ui.setStatus).toHaveBeenCalledWith("pi-hooks", "Running tool_call hook")
-            })
-
             await expect(resultPromise).resolves.toBeUndefined()
             expect(event.input).toEqual({ step: "after" })
-            expect(ui.setStatus).toHaveBeenLastCalledWith("pi-hooks", undefined)
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
     })
 
-    it("does not reuse a prior session's footer sink for a no-UI run after session_shutdown", async () => {
+    it("does not reuse a prior session's notification sink for a no-UI run after session_shutdown", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const resultPath = join(projectDir, "post-shutdown-result.txt")
@@ -1142,7 +1181,7 @@ describe("pi hooks loader", () => {
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("completed")
             })
-            firstUi.setStatus.mockClear()
+            firstUi.notify.mockClear()
 
             sessionShutdown?.(
                 { type: "session_shutdown", reason: "quit" },
@@ -1157,17 +1196,14 @@ describe("pi hooks loader", () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("completed")
             })
 
-            const reusedSinkCalls = firstUi.setStatus.mock.calls.filter(
-                ([key, text]) => key === "pi-hooks" && typeof text === "string",
-            )
-            expect(reusedSinkCalls).toHaveLength(0)
+            expect(firstUi.notify).not.toHaveBeenCalled()
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
     })
 
-    it("shows a footer status while a before_agent_start semantic hook fanout is running", async () => {
+    it("sends a configured start notification for a before_agent_start hook", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const stdout = JSON.stringify({
@@ -1225,18 +1261,16 @@ describe("pi hooks loader", () => {
             const resultPromise = beforeAgentStart?.(event, createExtensionContext(canonicalProjectDir, { ui }))
 
             await vi.waitFor(() => {
-                expect(ui.setStatus).toHaveBeenCalledWith("pi-hooks", "Preparing agent")
+                expect(ui.notify).toHaveBeenCalledWith("Preparing agent", "info")
             })
-
             await expect(resultPromise).resolves.toEqual({ message: { customType: "note", content: "hi" } })
-            expect(ui.setStatus).toHaveBeenLastCalledWith("pi-hooks", undefined)
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
         }
     })
 
-    it("shows a footer status while a match-all observe-only turn_start hook is running", async () => {
+    it("sends a configured start notification for a turn_start hook", async () => {
         const homeDir = await makeTempHome()
         const projectDir = join(homeDir, "workspace", "demo")
         const startedPath = join(projectDir, "turn-started.txt")
@@ -1291,14 +1325,12 @@ describe("pi hooks loader", () => {
             )
 
             await vi.waitFor(() => {
-                expect(ui.setStatus).toHaveBeenCalledWith("pi-hooks", "Starting turn")
+                expect(ui.notify).toHaveBeenCalledWith("Starting turn", "info")
             })
             await vi.waitFor(async () => {
                 await expect(readFile(resultPath, "utf8")).resolves.toBe("completed")
             })
-            await vi.waitFor(() => {
-                expect(ui.setStatus).toHaveBeenLastCalledWith("pi-hooks", undefined)
-            })
+            expect(ui.notify).toHaveBeenCalledTimes(1)
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
