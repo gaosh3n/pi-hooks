@@ -7,8 +7,8 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "pi update --extensions 1>&2",
-                        "statusMessage": "pi: updating extensions ..."
+                        "command": "node .pi/hooks/update-pi-packages.mjs",
+                        "statusMessage": "Pi package updates: checking ..."
                     }
                 ]
             }

@@ -376,6 +376,11 @@ type ActiveHookExecution = {
 
 type HookNotifyLevel = "info" | "warning" | "error"
 
+type HookScriptNotifyEnvelope = {
+    message: string
+    level?: HookNotifyLevel
+}
+
 type HookNotifySink = {
     notify(message: string, level?: HookNotifyLevel): void
 }
@@ -411,6 +416,7 @@ type FinalizedHookRun = {
 
 const HOOK_PROTOCOL_VERSION = 1 as const
 const SESSION_START_NOTIFICATION_DELAY_MS = 100
+const HOOK_STDERR_NOTIFY_PREFIX = "PI_HOOK_NOTIFY:"
 const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
 const emptyHookOutputSchema = {
     type: "object",
@@ -1151,6 +1157,97 @@ function safeNotify(notifyUi: unknown, message: string, level: HookNotifyLevel =
 
 function reportWarning(message: string, options: { notifyUi?: unknown; level?: HookNotifyLevel } = {}) {
     safeNotify(options.notifyUi ?? lastHookNotifySink, message, options.level ?? "warning")
+}
+
+function parseHookScriptNotifyEnvelope(
+    line: string,
+): { kind: "skip" } | { kind: "invalid"; warning: string } | { kind: "valid"; envelope: HookScriptNotifyEnvelope } {
+    if (!line.startsWith(HOOK_STDERR_NOTIFY_PREFIX)) {
+        return { kind: "skip" }
+    }
+
+    const payload = line.slice(HOOK_STDERR_NOTIFY_PREFIX.length)
+    let parsed: unknown
+    try {
+        parsed = JSON.parse(payload)
+    } catch (error) {
+        return {
+            kind: "invalid",
+            warning: `Ignoring invalid hook stderr notification: ${(error as Error).message}`,
+        }
+    }
+
+    if (typeof parsed !== "object" || parsed === null || !("message" in parsed) || typeof parsed.message !== "string") {
+        return {
+            kind: "invalid",
+            warning: "Ignoring invalid hook stderr notification: expected JSON object with string message",
+        }
+    }
+
+    const level = "level" in parsed ? parsed.level : undefined
+    if (level !== undefined && level !== "info" && level !== "warning" && level !== "error") {
+        return {
+            kind: "invalid",
+            warning: "Ignoring invalid hook stderr notification: level must be info, warning, or error",
+        }
+    }
+
+    return {
+        kind: "valid",
+        envelope: {
+            message: parsed.message,
+            ...(level === undefined ? {} : { level }),
+        },
+    }
+}
+
+function consumeHookStderrChunk(options: {
+    chunk: string
+    notifyUi?: unknown
+    buffer: { partialLine: string; passthrough: string[] }
+}) {
+    const text = options.buffer.partialLine + options.chunk
+    const lines = text.split(/\r?\n/)
+    options.buffer.partialLine = lines.pop() ?? ""
+
+    for (const line of lines) {
+        const parsed = parseHookScriptNotifyEnvelope(line)
+        if (parsed.kind === "skip") {
+            options.buffer.passthrough.push(`${line}\n`)
+            continue
+        }
+
+        if (parsed.kind === "invalid") {
+            reportWarning(parsed.warning, { notifyUi: options.notifyUi })
+            continue
+        }
+
+        safeNotify(options.notifyUi ?? lastHookNotifySink, parsed.envelope.message, parsed.envelope.level ?? "info")
+    }
+}
+
+function finalizeHookStderrBuffer(options: {
+    notifyUi?: unknown
+    buffer: { partialLine: string; passthrough: string[] }
+}) {
+    if (options.buffer.partialLine.length === 0) {
+        return
+    }
+
+    const line = options.buffer.partialLine
+    options.buffer.partialLine = ""
+    const parsed = parseHookScriptNotifyEnvelope(line)
+    if (parsed.kind === "skip") {
+        options.buffer.passthrough.push(line)
+        return
+    }
+
+    if (parsed.kind === "invalid") {
+        reportWarning(parsed.warning, { notifyUi: options.notifyUi })
+        return
+    }
+
+    safeNotify(options.notifyUi ?? lastHookNotifySink, parsed.envelope.message, parsed.envelope.level ?? "info")
 }
 
 function reportHookCommandFailureBeforeCompletion(notifyUi: unknown, hook: LoadedHook, error: unknown) {
@@ -2073,7 +2170,10 @@ async function runCommandHook(options: {
     })
 
     const stdoutChunks: Uint8Array[] = []
-    const stderrChunks: Uint8Array[] = []
+    const stderrBuffer = {
+        partialLine: "",
+        passthrough: [] as string[],
+    }
     const reportFailures = options.reportFailures ?? true
     const activeExecution: ActiveHookExecution = {
         child,
@@ -2135,7 +2235,11 @@ async function runCommandHook(options: {
             stdoutChunks.push(chunk)
         })
         child.stderr.on("data", (chunk: Uint8Array) => {
-            stderrChunks.push(chunk)
+            consumeHookStderrChunk({
+                chunk: Buffer.from(chunk).toString("utf8"),
+                notifyUi: options.notifyUi,
+                buffer: stderrBuffer,
+            })
         })
 
         const exitCode = await new Promise<number | null>((resolve, reject) => {
@@ -2156,7 +2260,8 @@ async function runCommandHook(options: {
         })
 
         const stdout = Buffer.concat(stdoutChunks).toString("utf8")
-        const stderr = Buffer.concat(stderrChunks).toString("utf8")
+        finalizeHookStderrBuffer({ notifyUi: options.notifyUi, buffer: stderrBuffer })
+        const stderr = stderrBuffer.passthrough.join("")
 
         if (activeExecution.cancellationReason === "timeout") {
             if (reportFailures) {

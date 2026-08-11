@@ -498,6 +498,14 @@ function createDelayedStdoutHookCommand(stdout: string, delayMs: number) {
     return `node --input-type=module -e ${JSON.stringify(`setTimeout(() => { process.stdout.write(process.argv[1]); }, ${delayMs})`)} ${JSON.stringify(stdout)}`
 }
 
+function createStderrNotifyHookCommand(options: {
+    notifications: Array<{ message: string; level?: "info" | "warning" | "error" }>
+    stderrTail?: string
+    exitCode?: number
+}) {
+    return `node --input-type=module -e "for (const item of JSON.parse(process.argv[1])) process.stderr.write(process.argv[2] + JSON.stringify(item) + '\\n'); if (process.argv[3]) process.stderr.write(process.argv[3]); process.exit(Number(process.argv[4]));" ${JSON.stringify(JSON.stringify(options.notifications))} ${JSON.stringify("PI_HOOK_NOTIFY:")} ${JSON.stringify(options.stderrTail ?? "")} ${JSON.stringify(String(options.exitCode ?? 0))}`
+}
+
 function createUiDouble() {
     return {
         notify: vi.fn((message: string) => {
@@ -1059,6 +1067,64 @@ describe("pi hooks loader", () => {
             await vi.waitFor(async () => {
                 await expect(readFile(firstResultPath, "utf8")).resolves.toBe("completed")
                 await expect(readFile(secondResultPath, "utf8")).resolves.toBe("completed")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("streams special stderr notification lines from session_start hooks to ui notifications", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStderrNotifyHookCommand({
+                                        notifications: [
+                                            { message: "Pi package updates available (3)" },
+                                            { message: "Running: pi update --extensions" },
+                                            { message: "Pi packages are up to date" },
+                                        ],
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+            const ui = createUiDouble()
+            const sessionStart = getSessionStartHandler(handlers)
+
+            await sessionStart?.(
+                { type: "session_start", reason: "startup" },
+                createExtensionContext(canonicalProjectDir, { ui }),
+            )
+
+            await vi.waitFor(() => {
+                expect(ui.notify).toHaveBeenCalledWith("Pi package updates available (3)", "info")
+                expect(ui.notify).toHaveBeenCalledWith("Running: pi update --extensions", "info")
+                expect(ui.notify).toHaveBeenCalledWith("Pi packages are up to date", "info")
             })
         } finally {
             process.env.HOME = previousHome
@@ -3668,6 +3734,69 @@ describe("pi hooks loader", () => {
             await expect(readFile(outputPath, "utf8")).rejects.toThrow()
             await vi.waitFor(async () => {
                 await expect(readFile(outputPath, "utf8")).resolves.toBe("done")
+            })
+        } finally {
+            process.env.HOME = previousHome
+            process.chdir(previousCwd)
+        }
+    })
+
+    it("strips stderr notification lines from non-zero hook failure reports", async () => {
+        const homeDir = await makeTempHome()
+        const projectDir = join(homeDir, "workspace", "demo")
+
+        await mkdir(join(projectDir, ".pi"), { recursive: true })
+        await writeFile(
+            join(projectDir, ".pi", "hooks.json"),
+            JSON.stringify({
+                hooks: {
+                    session_start: [
+                        {
+                            matcher: "startup",
+                            hooks: [
+                                {
+                                    type: "command",
+                                    command: createStderrNotifyHookCommand({
+                                        notifications: [{ message: "Running: pi update --extensions" }],
+                                        stderrTail: "plain-error",
+                                        exitCode: 7,
+                                    }),
+                                },
+                            ],
+                        },
+                    ],
+                },
+            }),
+        )
+
+        const canonicalHomeDir = await realpath(homeDir)
+        const canonicalProjectDir = await realpath(projectDir)
+        const previousHome = process.env.HOME
+        const previousCwd = process.cwd()
+        process.env.HOME = canonicalHomeDir
+        process.chdir(canonicalProjectDir)
+
+        try {
+            const { pi, handlers } = createExtensionApiDouble()
+            setup(pi)
+            const ui = createUiDouble()
+            const sessionStart = getSessionStartHandler(handlers)
+
+            await expect(
+                sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui }),
+                ),
+            ).resolves.toBeUndefined()
+            await vi.waitFor(() => {
+                expect(ui.notify).toHaveBeenCalledWith("Running: pi update --extensions", "info")
+                expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("plain-error"), "warning")
+
+                const warningMessages = ui.notify.mock.calls
+                    .filter((call) => (call as unknown[])[1] === "warning")
+                    .map((call) => String(call[0]))
+                expect(warningMessages.some((message) => message.includes("stderr: plain-error"))).toBe(true)
+                expect(warningMessages.some((message) => message.includes("stderr: PI_HOOK_NOTIFY:"))).toBe(false)
             })
         } finally {
             process.env.HOME = previousHome
