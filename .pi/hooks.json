@@ -7,7 +7,7 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "node .pi/hooks/update-pi-packages.mjs",
+                        "command": "node .pi/pi-hooks/update-pi-packages.mjs",
                         "statusMessage": "Pi package updates: checking ..."
                     }
                 ]
@@ -19,12 +19,12 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash .pi/hooks/tool-call-oxfmt.sh",
+                        "command": "bash .pi/pi-hooks/tool-call-oxfmt.sh",
                         "statusMessage": "oxfmt: checking proposed write ..."
                     },
                     {
                         "type": "command",
-                        "command": "bash .pi/hooks/tool-call-oxlint.sh",
+                        "command": "bash .pi/pi-hooks/tool-call-oxlint.sh",
                         "statusMessage": "oxlint: checking proposed write ..."
                     }
                 ]

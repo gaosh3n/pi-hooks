@@ -82,6 +82,12 @@ Concrete Pi policy:
 - deduplicate only by exact file path so the same file is not loaded twice
 - omit TOML hook loading entirely
 
+Naming note after ADR #3:
+
+- `hooks.json` remains the Pi Hooks config file at both global and project scope
+- Pi Hooks-owned helper assets under `.pi` should live in `pi-hooks/`, not `hooks/`
+- example helper command paths should therefore prefer `~/.pi/pi-hooks/...` and `<project>/.pi/pi-hooks/...`
+
 ## #3: How should Pi load hooks after they are discovered?
 
 Blocked by: #1, #2
