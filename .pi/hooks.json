@@ -13,6 +13,18 @@
                 ]
             }
         ],
+        "resources_discover": [
+            {
+                "matcher": "startup|reload",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "node .pi/pi-hooks/list-pi-resources.mjs",
+                        "statusMessage": "Pi resources: listing extensions, packages, and skills ..."
+                    }
+                ]
+            }
+        ],
         "tool_call": [
             {
                 "matcher": "bash|edit|write",
