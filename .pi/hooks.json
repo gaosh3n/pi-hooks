@@ -29,6 +29,16 @@
                     }
                 ]
             }
+        ],
+        "agent_settled": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash .pi/pi-hooks/agent-settled-ghostty-bell.sh"
+                    }
+                ]
+            }
         ]
     }
 }
