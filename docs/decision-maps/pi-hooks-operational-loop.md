@@ -105,13 +105,18 @@ What operator-facing visible UI surface should Pi Hooks have?
 
 Resolved.
 
-Per `docs/adr/0004-split-pi-hooks-operational-output-across-dedicated-seams.md`, the visible hook UI surface should be split across dedicated Pi-native seams. This reverses the earlier notify-only choice.
+Per `docs/adr/0004-split-pi-hooks-operational-output-across-dedicated-seams.md` and `docs/adr/0005-extend-durable-operator-log-seam-to-helper-script-output-via-pi-hook-msg.md`, the visible hook UI surface should be split across dedicated Pi-native seams. This reverses the earlier notify-only choice.
 
 Visible surfaces:
 
 - `ctx.ui.notify(...)` through `safeNotify(...)` for high-signal alerts
-- durable per-run operator-log entries via `appendCustomMessageEntry(..., display:false)` plus a custom renderer
+- durable operator-log entries via `appendCustomMessageEntry(..., display:false)` plus a custom renderer, covering both runtime per-run history (ADR 0004) and helper-script output (ADR 0005)
 - `ctx.ui.setStatus(...)` for lightweight aggregate in-flight status
+
+Helper-script output has two stderr prefixes (ADR 0005):
+
+- `PI_HOOK_NOTIFY:` routes to the ephemeral `ctx.ui.notify(...)`, unchanged from prior behavior
+- `PI_HOOK_MSG:` routes to the durable `custom_message` seam (one persisted, non-superseding entry per envelope, rendered in transcript)
 
 Not part of the visible UI surface in Phase 1:
 
@@ -122,7 +127,7 @@ Not part of the visible UI surface in Phase 1:
 Why:
 
 - notifications remain the right seam for configured start messages and notable failed/blocked signals
-- a durable operator log avoids same-level supersession for per-run history
+- a durable operator log avoids same-level supersession for per-run history and helper-script output
 - aggregate status answers “what is happening now?” separately from durable per-run history
 - current Pi extension APIs already support this split without Pi core changes
 
@@ -131,6 +136,7 @@ This means the operator-facing visible loop should be:
 - a configured `statusMessage` emits one informational notification when its hook starts
 - notable failures and blocks continue to use the same notification path
 - each `HookRunRecord` gets one durable rendered operator-log entry when it finalizes
+- each `PI_HOOK_MSG:` envelope gets one durable rendered operator-log entry (ADF 0005)
 - aggregate in-flight hook activity is reflected through `ctx.ui.setStatus(...)`
 - operator-visible warnings/failures must use Pi-native UI surfaces rather than raw console warnings
 
@@ -272,13 +278,18 @@ Can Pi Hooks deliver a useful operational loop entirely through current extensio
 
 Resolved.
 
-Per ADR 0004, the useful operational loop defined in this map should stay extension-owned.
+Per ADR 0004 and ADR 0005, the useful operational loop defined in this map should stay extension-owned.
 
 Use the current Pi extension surface:
 
 - `ctx.ui.notify(...)` through `safeNotify(...)` for configured start messages and notable failed/blocked signals
-- `appendCustomMessageEntry(..., display:false)` plus a custom renderer for durable per-run operator-log entries
+- `appendCustomMessageEntry(..., display:false)` plus a custom renderer for durable operator-log entries, covering runtime per-run finalization (ADR 0004) and helper-script `PI_HOOK_MSG:` output (ADR 0005)
 - `ctx.ui.setStatus(...)` for lightweight aggregate in-flight status
+
+Helper-script prefixes (ADR 0005):
+
+- `PI_HOOK_NOTIFY:` stays ephemeral (`safeNotify(...)` → `ctx.ui.notify(...)`)
+- `PI_HOOK_MSG:` routes to the durable `custom_message` seam, one persisted non-superseding entry per envelope
 
 Constraint:
 
