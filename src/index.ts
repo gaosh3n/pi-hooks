@@ -428,7 +428,9 @@ type FinalizedHookRun = {
 const HOOK_PROTOCOL_VERSION = 1 as const
 const SESSION_START_NOTIFICATION_DELAY_MS = 100
 const HOOK_STDERR_NOTIFY_PREFIX = "PI_HOOK_NOTIFY:"
+const HOOK_STDERR_MSG_PREFIX = "PI_HOOK_MSG:"
 const HOOK_RUN_MESSAGE_TYPE = "pi-hooks-hook-run"
+const HOOK_NOTIFY_MESSAGE_TYPE = "pi-hooks-hook-notify"
 const HOOK_STATUS_KEY = "pi-hooks"
 const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
 const emptyHookOutputSchema = {
@@ -658,6 +660,13 @@ export default function setup(pi: ExtensionAPI) {
 
     pi.registerMessageRenderer(HOOK_RUN_MESSAGE_TYPE, (message) => {
         return new Text(String(message.content ?? "Hook run"), 0, 0)
+    })
+
+    pi.registerMessageRenderer(HOOK_NOTIFY_MESSAGE_TYPE, (message) => {
+        const details = message.details as { level?: string; message?: string } | undefined
+        const level = details?.level ?? "info"
+        const text = String(message.content ?? details?.message ?? "Hook notify")
+        return new Text(`[${level}] ${text}`, 0, 0)
     })
 
     const ensureBeforeAgentStartSlotHandlers = (slotCount: number) => {
@@ -1251,28 +1260,43 @@ function reportWarning(message: string, options: { notifyUi?: unknown; level?: H
     safeNotify(options.notifyUi ?? lastHookNotifySink, message, options.level ?? "warning")
 }
 
-function parseHookScriptNotifyEnvelope(
-    line: string,
-): { kind: "skip" } | { kind: "invalid"; warning: string } | { kind: "valid"; envelope: HookScriptNotifyEnvelope } {
-    if (!line.startsWith(HOOK_STDERR_NOTIFY_PREFIX)) {
+type HookStderrChannel = "notify" | "msg"
+
+type ParsedHookStderrEnvelope =
+    | { kind: "skip" }
+    | { kind: "invalid"; prefix: string; warning: string }
+    | { kind: "valid"; prefix: string; channel: HookStderrChannel; envelope: HookScriptNotifyEnvelope }
+
+function parseHookScriptNotifyEnvelope(line: string): ParsedHookStderrEnvelope {
+    let prefix: string | undefined
+    let channel: HookStderrChannel | undefined
+    if (line.startsWith(HOOK_STDERR_NOTIFY_PREFIX)) {
+        prefix = HOOK_STDERR_NOTIFY_PREFIX
+        channel = "notify"
+    } else if (line.startsWith(HOOK_STDERR_MSG_PREFIX)) {
+        prefix = HOOK_STDERR_MSG_PREFIX
+        channel = "msg"
+    } else {
         return { kind: "skip" }
     }
 
-    const payload = line.slice(HOOK_STDERR_NOTIFY_PREFIX.length)
+    const payload = line.slice(prefix.length)
     let parsed: unknown
     try {
         parsed = JSON.parse(payload)
     } catch (error) {
         return {
             kind: "invalid",
-            warning: `Ignoring invalid hook stderr notification: ${(error as Error).message}`,
+            prefix,
+            warning: `Ignoring invalid hook stderr ${channel}: ${(error as Error).message}`,
         }
     }
 
     if (typeof parsed !== "object" || parsed === null || !("message" in parsed) || typeof parsed.message !== "string") {
         return {
             kind: "invalid",
-            warning: "Ignoring invalid hook stderr notification: expected JSON object with string message",
+            prefix,
+            warning: `Ignoring invalid hook stderr ${channel}: expected JSON object with string message`,
         }
     }
 
@@ -1280,12 +1304,15 @@ function parseHookScriptNotifyEnvelope(
     if (level !== undefined && level !== "info" && level !== "warning" && level !== "error") {
         return {
             kind: "invalid",
-            warning: "Ignoring invalid hook stderr notification: level must be info, warning, or error",
+            prefix,
+            warning: `Ignoring invalid hook stderr ${channel}: level must be info, warning, or error`,
         }
     }
 
     return {
         kind: "valid",
+        prefix,
+        channel,
         envelope: {
             message: parsed.message,
             ...(level === undefined ? {} : { level }),
@@ -1293,9 +1320,47 @@ function parseHookScriptNotifyEnvelope(
     }
 }
 
+function routeHookStderrEnvelope(
+    parsed: { kind: "valid"; prefix: string; channel: HookStderrChannel; envelope: HookScriptNotifyEnvelope },
+    options: {
+        notifyUi?: unknown
+        sessionManager?: HookSessionManager | undefined
+        runId?: string | undefined
+        eventName?: string | undefined
+    },
+) {
+    const { envelope, channel } = parsed
+    if (channel === "notify") {
+        safeNotify(options.notifyUi ?? lastHookNotifySink, envelope.message, envelope.level ?? "info")
+        return
+    }
+
+    // channel === "msg" -> durable operator-log seam
+    const sessionManager = options.sessionManager ?? lastHookSessionManager
+    if (sessionManager === undefined) {
+        return
+    }
+
+    const details: Record<string, unknown> = {
+        level: envelope.level ?? "info",
+        message: envelope.message,
+    }
+    if (options.eventName !== undefined) {
+        details.eventName = options.eventName
+    }
+    if (options.runId !== undefined) {
+        details.runId = options.runId
+    }
+
+    sessionManager.appendCustomMessageEntry(HOOK_NOTIFY_MESSAGE_TYPE, envelope.message, false, details)
+}
+
 function consumeHookStderrChunk(options: {
     chunk: string
     notifyUi?: unknown
+    sessionManager?: HookSessionManager | undefined
+    runId?: string | undefined
+    eventName?: string | undefined
     buffer: { partialLine: string; passthrough: string[] }
 }) {
     const text = options.buffer.partialLine + options.chunk
@@ -1314,12 +1379,15 @@ function consumeHookStderrChunk(options: {
             continue
         }
 
-        safeNotify(options.notifyUi ?? lastHookNotifySink, parsed.envelope.message, parsed.envelope.level ?? "info")
+        routeHookStderrEnvelope(parsed, options)
     }
 }
 
 function finalizeHookStderrBuffer(options: {
     notifyUi?: unknown
+    sessionManager?: HookSessionManager | undefined
+    runId?: string | undefined
+    eventName?: string | undefined
     buffer: { partialLine: string; passthrough: string[] }
 }) {
     if (options.buffer.partialLine.length === 0) {
@@ -1339,7 +1407,7 @@ function finalizeHookStderrBuffer(options: {
         return
     }
 
-    safeNotify(options.notifyUi ?? lastHookNotifySink, parsed.envelope.message, parsed.envelope.level ?? "info")
+    routeHookStderrEnvelope(parsed, options)
 }
 
 function reportHookCommandFailureBeforeCompletion(notifyUi: unknown, hook: LoadedHook, error: unknown) {
@@ -2341,6 +2409,9 @@ async function runCommandHook(options: {
             consumeHookStderrChunk({
                 chunk: Buffer.from(chunk).toString("utf8"),
                 notifyUi: options.notifyUi,
+                sessionManager: lastHookSessionManager,
+                runId: hookRunId,
+                eventName: options.payload.event,
                 buffer: stderrBuffer,
             })
         })
@@ -2363,7 +2434,13 @@ async function runCommandHook(options: {
         })
 
         const stdout = Buffer.concat(stdoutChunks).toString("utf8")
-        finalizeHookStderrBuffer({ notifyUi: options.notifyUi, buffer: stderrBuffer })
+        finalizeHookStderrBuffer({
+            notifyUi: options.notifyUi,
+            sessionManager: lastHookSessionManager,
+            runId: hookRunId,
+            eventName: options.payload.event,
+            buffer: stderrBuffer,
+        })
         const stderr = stderrBuffer.passthrough.join("")
 
         if (activeExecution.cancellationReason === "timeout") {

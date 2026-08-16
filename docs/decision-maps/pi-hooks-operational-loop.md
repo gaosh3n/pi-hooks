@@ -263,7 +263,7 @@ Mapping rules:
 
 If later debugging needs a little more semantic color, add it as a typed run entry, not as new always-present top-level fields.
 
-This keeps the shared hook-run model lean while staying expressive enough for start notifications, notable failure notifications, one durable per-run operator-log entry at finalization, and aggregate in-flight status.
+This keeps the shared hook-run model lean while staying expressive enough for start notifications, notable failure notifications, one durable per-run operator-log entry at finalization, one durable `PI_HOOK_MSG:` entry per helper-script envelope (ADR 0005), and aggregate in-flight status.
 
 ## #9: Should hook-run observability stay extension-owned, or do we need Pi core protocol work?
 

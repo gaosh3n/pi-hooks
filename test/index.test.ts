@@ -8325,6 +8325,365 @@ describe("pi hooks loader", () => {
         })
     })
 
+    describe("helper-script output seams (ADR 0005)", () => {
+        it("registers a custom message renderer for durable hook-notify entries", () => {
+            const { pi, registerMessageRenderer } = createExtensionApiDouble()
+
+            setup(pi)
+
+            expect(registerMessageRenderer).toHaveBeenCalledWith("pi-hooks-hook-notify", expect.any(Function))
+        })
+
+        it("routes two same-level info PI_HOOK_MSG envelopes to two distinct durable entries (no supersession)", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            const firstEnvelope = JSON.stringify({ message: "first info note", level: "info" })
+            const secondEnvelope = JSON.stringify({ message: "second info note", level: "info" })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [
+                            {
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: `printf 'PI_HOOK_MSG:${firstEnvelope}\\nPI_HOOK_MSG:${secondEnvelope}\\n' 1>&2`,
+                                        timeout: 5000,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                })
+
+                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
+                    (call) => call[0] === "pi-hooks-hook-notify",
+                )
+                expect(msgEntries).toHaveLength(2)
+                expect(msgEntries[0]![1]).toBe("first info note")
+                expect(msgEntries[1]![1]).toBe("second info note")
+                expect(msgEntries[0]![2]).toBe(false)
+                expect(msgEntries[1]![2]).toBe(false)
+                // distinct invocations (content differs), proving the second did not overwrite the first
+                expect(msgEntries[0]![1]).not.toBe(msgEntries[1]![1])
+
+                // level preserved in details
+                expect(msgEntries[0]![3]).toMatchObject({ level: "info", message: "first info note" })
+                expect(msgEntries[1]![3]).toMatchObject({ level: "info", message: "second info note" })
+
+                // the two info notices must NOT route to ephemeral notify (the supersession-prone seam)
+                expect(ui.notify).not.toHaveBeenCalledWith("first info note", expect.anything())
+                expect(ui.notify).not.toHaveBeenCalledWith("second info note", expect.anything())
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+        it("keeps PI_HOOK_NOTIFY output ephemeral (unchanged) and off the durable seam", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            const envelope = JSON.stringify({ message: "ephemeral notice", level: "info" })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [
+                            {
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: `printf 'PI_HOOK_NOTIFY:${envelope}\\n' 1>&2`,
+                                        timeout: 5000,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                })
+
+                // ephemeral: routed to notify
+                expect(ui.notify).toHaveBeenCalledWith("ephemeral notice", "info")
+                // NOT durable: no pi-hooks-hook-notify durable entry
+                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
+                    (call) => call[0] === "pi-hooks-hook-notify",
+                )
+                expect(msgEntries).toHaveLength(0)
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+
+        it("routes invalid PI_HOOK_MSG envelopes to the ephemeral diagnostic path, not durable", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [
+                            {
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: "printf 'PI_HOOK_MSG:not-json\\n' 1>&2",
+                                        timeout: 5000,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                })
+
+                // invalid -> ephemeral diagnostic via reportWarning -> ctx.ui.notify
+                expect(ui.notify).toHaveBeenCalledWith(
+                    expect.stringContaining("Ignoring invalid hook stderr msg"),
+                    "warning",
+                )
+                // NOT durable
+                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
+                    (call) => call[0] === "pi-hooks-hook-notify",
+                )
+                expect(msgEntries).toHaveLength(0)
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+
+        it("defaults level to info when a bare PI_HOOK_MSG envelope omits level", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            const envelope = JSON.stringify({ message: "bare msg" })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [
+                            {
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: `printf 'PI_HOOK_MSG:${envelope}\\n' 1>&2`,
+                                        timeout: 5000,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                })
+
+                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
+                    (call) => call[0] === "pi-hooks-hook-notify",
+                )
+                expect(msgEntries).toHaveLength(1)
+                expect(msgEntries[0]![3]).toMatchObject({ level: "info", message: "bare msg" })
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+
+        it("preserves run association (eventName, runId) in durable PI_HOOK_MSG entries", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            const envelope = JSON.stringify({ message: "associated msg", level: "warning" })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [
+                            {
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: `printf 'PI_HOOK_MSG:${envelope}\\n' 1>&2`,
+                                        timeout: 5000,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                })
+
+                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
+                    (call) => call[0] === "pi-hooks-hook-notify",
+                )
+                expect(msgEntries).toHaveLength(1)
+                expect(msgEntries[0]![3]).toMatchObject({
+                    level: "warning",
+                    message: "associated msg",
+                    eventName: "turn_start",
+                    runId: expect.any(String),
+                })
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+    })
+
     it("exports a setup function", () => {
         expect(setup).toBeTypeOf("function")
     })
