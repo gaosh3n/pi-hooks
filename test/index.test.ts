@@ -266,6 +266,7 @@ async function makeTempHome() {
 function createExtensionApiDouble() {
     const handlers: HandlerRegistry = {}
     const sendMessage = vi.fn()
+    const registerMessageRenderer = vi.fn()
     const pi = {
         on(event: string, handler: (...args: unknown[]) => unknown) {
             const existing = handlers[event]
@@ -282,9 +283,10 @@ function createExtensionApiDouble() {
             handlers[event] = [existing, handler]
         },
         sendMessage,
+        registerMessageRenderer,
     } as unknown as ExtensionAPI
 
-    return { pi, handlers, sendMessage }
+    return { pi, handlers, sendMessage, registerMessageRenderer }
 }
 
 function getSessionStartHandler(handlers: HandlerRegistry) {
@@ -511,20 +513,32 @@ function createUiDouble() {
         notify: vi.fn((message: string) => {
             console.warn(message)
         }),
+        setStatus: vi.fn(),
         select: vi.fn(),
         confirm: vi.fn(),
         input: vi.fn(),
     }
 }
 
+function createSessionManagerDouble() {
+    return {
+        appendCustomMessageEntry: vi.fn(),
+    }
+}
+
 function createExtensionContext(
     cwd: string,
-    options: { signal?: AbortSignal; ui?: ReturnType<typeof createUiDouble> } = {},
+    options: {
+        signal?: AbortSignal
+        ui?: ReturnType<typeof createUiDouble>
+        sessionManager?: ReturnType<typeof createSessionManagerDouble>
+    } = {},
 ) {
     return {
         cwd,
         signal: options.signal,
         ui: options.ui ?? createUiDouble(),
+        sessionManager: options.sessionManager,
         hasUI: true,
         mode: "tui",
     } as unknown as ExtensionContext
@@ -8088,6 +8102,222 @@ describe("pi hooks loader", () => {
                     expect.stringContaining("Hook turn_start failed: nonzero_exit"),
                     "warning",
                 )
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+    })
+
+    describe("operator output seams (ADR 0004 phase 1)", () => {
+        it("registers a custom message renderer for durable hook-run log entries", () => {
+            const { pi, registerMessageRenderer } = createExtensionApiDouble()
+
+            setup(pi)
+
+            expect(registerMessageRenderer).toHaveBeenCalledWith("pi-hooks-hook-run", expect.any(Function))
+        })
+
+        it("appends one durable operator-log entry when an observe-only hook run finalizes", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [{ hooks: [{ type: "command", command: "true" }] }],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                    expect(sessionManager.appendCustomMessageEntry).toHaveBeenCalledTimes(1)
+                    expect(sessionManager.appendCustomMessageEntry).toHaveBeenCalledWith(
+                        "pi-hooks-hook-run",
+                        "Hook turn_start completed",
+                        false,
+                        expect.objectContaining({
+                            eventName: "turn_start",
+                            status: "completed",
+                            entries: [],
+                        }),
+                    )
+                })
+
+                expect(ui.notify).not.toHaveBeenCalled()
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+
+        it("updates aggregate hook status while observe-only hooks are active and clears it on finalization", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+            const startedPath = join(projectDir, "turn-started.txt")
+            const resultPath = join(projectDir, "turn-result.txt")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [
+                            {
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: createLongRunningHookCommand({
+                                            startedPath,
+                                            resultPath,
+                                            completeAfterMs: 150,
+                                        }),
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(ui.setStatus).toHaveBeenCalledWith("pi-hooks", "hooks: 1 running")
+                })
+                await vi.waitFor(async () => {
+                    await expect(readFile(resultPath, "utf8")).resolves.toBe("completed")
+                })
+                await vi.waitFor(() => {
+                    expect(ui.setStatus).toHaveBeenCalledWith("pi-hooks", undefined)
+                })
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+
+        it("writes the durable operator-log entry before emitting the Slice B failure notification", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        tool_call: [
+                            {
+                                matcher: "Write",
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: createDelayedStdoutHookCommand(
+                                            JSON.stringify({
+                                                version: 1,
+                                                event: "tool_call",
+                                                output: { block: { reason: "forbidden path" } },
+                                            }),
+                                            30,
+                                        ),
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const toolCall = getRuntimeHandler<ToolCallEvent>(handlers, "tool_call")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await toolCall?.(
+                    { type: "tool_call", toolName: "Write", input: {} } as ToolCallEvent,
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                    expect(sessionManager.appendCustomMessageEntry).toHaveBeenCalledTimes(1)
+                    expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("Hook tool_call blocked"), "warning")
+                })
+
+                const blockedNotifyIndex = ui.notify.mock.calls.findIndex(
+                    (call) => typeof call[0] === "string" && call[0].includes("Hook tool_call blocked"),
+                )
+                expect(blockedNotifyIndex).toBeGreaterThanOrEqual(0)
+                const blockedNotifyOrder = ui.notify.mock.invocationCallOrder[blockedNotifyIndex]!
+                const appendOrder = sessionManager.appendCustomMessageEntry.mock.invocationCallOrder[0]!
+                expect(appendOrder).toBeLessThan(blockedNotifyOrder)
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)

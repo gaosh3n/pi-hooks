@@ -16,6 +16,7 @@ import type {
     ToolCallEventResult,
     ToolResultEvent,
 } from "@earendil-works/pi-coding-agent"
+import { Text } from "@earendil-works/pi-tui"
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 type JsonObject = { [key: string]: JsonValue }
@@ -385,12 +386,22 @@ type HookNotifySink = {
     notify(message: string, level?: HookNotifyLevel): void
 }
 
+type HookStatusSink = {
+    setStatus(key: string, text: string | undefined): void
+}
+
+type HookSessionManager = {
+    appendCustomMessageEntry(customType: string, content: unknown, display: boolean, details?: unknown): void
+}
+
 type HookRunRecord = {
     id: string
     eventName: string
     statusMessage: string | undefined
     startedAt: number
     displayOrder: number
+    /** Live session sink handle for durable operator-log writes; not part of persisted run state. */
+    sessionManager: HookSessionManager | undefined
 }
 
 type HookRunStatus = "running" | "completed" | "failed" | "blocked" | "stopped"
@@ -417,6 +428,8 @@ type FinalizedHookRun = {
 const HOOK_PROTOCOL_VERSION = 1 as const
 const SESSION_START_NOTIFICATION_DELAY_MS = 100
 const HOOK_STDERR_NOTIFY_PREFIX = "PI_HOOK_NOTIFY:"
+const HOOK_RUN_MESSAGE_TYPE = "pi-hooks-hook-run"
+const HOOK_STATUS_KEY = "pi-hooks"
 const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
 const emptyHookOutputSchema = {
     type: "object",
@@ -564,6 +577,8 @@ let activeHookRuns = new Map<string, HookRunRecord>()
 let nextHookRunDisplayOrder = 0
 let finalizedHookRuns = new Map<string, FinalizedHookRun>()
 let lastHookNotifySink: HookNotifySink | undefined
+let lastHookStatusSink: HookStatusSink | undefined
+let lastHookSessionManager: HookSessionManager | undefined
 let hookInvalidStdoutCounts = new Map<string, number>()
 let hookInvalidStdoutNotified = new Set<string>()
 const HOOK_INVALID_STDOUT_NOTIFY_THRESHOLD = 2
@@ -641,6 +656,10 @@ function compileBeforeAgentStartHookSlots(registry: HookRegistry): BeforeAgentSt
 export default function setup(pi: ExtensionAPI) {
     let registeredBeforeAgentStartSlotCount = 0
 
+    pi.registerMessageRenderer(HOOK_RUN_MESSAGE_TYPE, (message) => {
+        return new Text(String(message.content ?? "Hook run"), 0, 0)
+    })
+
     const ensureBeforeAgentStartSlotHandlers = (slotCount: number) => {
         while (registeredBeforeAgentStartSlotCount < slotCount) {
             const slotIndex = registeredBeforeAgentStartSlotCount
@@ -664,6 +683,11 @@ export default function setup(pi: ExtensionAPI) {
         finalizedHookRuns.clear()
         hookInvalidStdoutCounts.clear()
         hookInvalidStdoutNotified.clear()
+        lastHookStatusSink = getHookStatusSink(ctx.ui)
+        lastHookSessionManager = getHookSessionManager(
+            (ctx as ExtensionContext & { sessionManager?: unknown }).sessionManager,
+        )
+        updateHookStatusSurface(ctx.ui)
         dispatchSessionStartHooks(event, ctx)
     })
 
@@ -769,11 +793,18 @@ export default function setup(pi: ExtensionAPI) {
         activeRegistry = EMPTY_REGISTRY
         activeBeforeAgentStartSlots = []
         cancelActiveHookExecutions("shutdown")
+        // Intentional: shutdown-cancelled runs do not durable-log. The child exit fires
+        // asynchronously after activeHookRuns.clear(), so finishHookRun returns early. The
+        // operator audience is gone on an ending session (ADR 0004 scopes durable entries to
+        // finalization, not cancellation). Closing this audit gap is a Phase 2 candidate.
         activeHookRuns.clear()
+        updateHookStatusSurface(ctx.ui)
         finalizedHookRuns.clear()
         hookInvalidStdoutCounts.clear()
         hookInvalidStdoutNotified.clear()
         lastHookNotifySink = undefined
+        lastHookStatusSink = undefined
+        lastHookSessionManager = undefined
         nextHookRunDisplayOrder = 0
         dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
     })
@@ -1133,6 +1164,22 @@ function getHookNotifySink(value: unknown): HookNotifySink | undefined {
     return typeof value.notify === "function" ? (value as HookNotifySink) : undefined
 }
 
+function getHookStatusSink(value: unknown): HookStatusSink | undefined {
+    if (typeof value !== "object" || value === null || !("setStatus" in value)) {
+        return undefined
+    }
+
+    return typeof value.setStatus === "function" ? (value as HookStatusSink) : undefined
+}
+
+function getHookSessionManager(value: unknown): HookSessionManager | undefined {
+    if (typeof value !== "object" || value === null || !("appendCustomMessageEntry" in value)) {
+        return undefined
+    }
+
+    return typeof value.appendCustomMessageEntry === "function" ? (value as HookSessionManager) : undefined
+}
+
 function isStaleContextError(error: unknown) {
     return error instanceof Error && /stale/i.test(error.message)
 }
@@ -1153,6 +1200,51 @@ function safeNotify(notifyUi: unknown, message: string, level: HookNotifyLevel =
 
         return false
     }
+}
+
+function safeSetStatus(statusUi: unknown, text: string | undefined) {
+    const statusSink = getHookStatusSink(statusUi)
+    if (statusSink === undefined) {
+        return false
+    }
+
+    try {
+        statusSink.setStatus(HOOK_STATUS_KEY, text)
+        return true
+    } catch (error) {
+        if (!isStaleContextError(error)) {
+            throw error
+        }
+
+        return false
+    }
+}
+
+function updateHookStatusSurface(statusUi?: unknown) {
+    const statusSink = getHookStatusSink(statusUi) ?? lastHookStatusSink
+    if (statusSink === undefined) {
+        return false
+    }
+
+    lastHookStatusSink = statusSink
+    return safeSetStatus(statusSink, activeHookRuns.size === 0 ? undefined : `hooks: ${activeHookRuns.size} running`)
+}
+
+function summarizeHookRun(run: FinalizedHookRun) {
+    return `Hook ${run.eventName} ${run.status}${run.reason === undefined ? "" : `: ${run.reason}`}`
+}
+
+function appendHookRunOperatorLog(sessionManager: HookSessionManager | undefined, run: FinalizedHookRun) {
+    if (sessionManager === undefined) {
+        return
+    }
+
+    sessionManager.appendCustomMessageEntry(
+        HOOK_RUN_MESSAGE_TYPE,
+        summarizeHookRun(run),
+        false,
+        serializeJsonValue(run),
+    )
 }
 
 function reportWarning(message: string, options: { notifyUi?: unknown; level?: HookNotifyLevel } = {}) {
@@ -1262,6 +1354,13 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
         lastHookNotifySink = notifySink
     }
 
+    const statusSink = getHookStatusSink(options.notifyUi)
+    if (statusSink !== undefined) {
+        lastHookStatusSink = statusSink
+    }
+
+    const sessionManager = lastHookSessionManager
+
     const displayOrder = nextHookRunDisplayOrder
     nextHookRunDisplayOrder += 1
 
@@ -1276,9 +1375,11 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
         statusMessage: options.statusMessage,
         startedAt,
         displayOrder,
+        sessionManager,
     }
 
     activeHookRuns.set(run.id, run)
+    updateHookStatusSurface(options.notifyUi)
     const statusMessage = options.statusMessage
     if (statusMessage !== undefined) {
         if (startNotificationDueAt !== undefined) {
@@ -1314,6 +1415,8 @@ function finishHookRun(
         entries: finalization.entries ?? [],
     }
     finalizedHookRuns.set(runId, finalizedRun)
+    updateHookStatusSurface()
+    appendHookRunOperatorLog(activeRun.sessionManager, finalizedRun)
     notifyOnFinalize(finalizedRun)
 }
 
