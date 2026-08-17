@@ -7,12 +7,12 @@ import os from "node:os"
 import path from "node:path"
 import process from "node:process"
 
-const HOOK_NOTIFY_PREFIX = "PI_HOOK_NOTIFY:"
+const HOOK_MSG_PREFIX = "PI_HOOK_MSG:"
 const homeDir = os.homedir()
 const cwd = process.cwd()
 
-function notify(message, level = "info") {
-    process.stderr.write(`${HOOK_NOTIFY_PREFIX}${JSON.stringify({ message, level })}\n`)
+function emitHookMessage(message, level = "info") {
+    process.stderr.write(`${HOOK_MSG_PREFIX}${JSON.stringify({ message, level })}\n`)
 }
 
 function expandHome(inputPath) {
@@ -43,7 +43,7 @@ async function readJsonIfExists(filePath) {
     try {
         return JSON.parse(await readFile(filePath, "utf8"))
     } catch (error) {
-        notify(`Pi resources: ignoring invalid JSON at ${toDisplayPath(filePath)}`, "warning")
+        emitHookMessage(`Pi resources: ignoring invalid JSON at ${toDisplayPath(filePath)}`, "info")
         return undefined
     }
 }
@@ -70,7 +70,12 @@ function resolvePackageSources(value) {
         if (typeof item === "string" && item.trim().length > 0) {
             return [item]
         }
-        if (typeof item === "object" && item !== null && typeof item.source === "string" && item.source.trim().length > 0) {
+        if (
+            typeof item === "object" &&
+            item !== null &&
+            typeof item.source === "string" &&
+            item.source.trim().length > 0
+        ) {
             return [item.source]
         }
         return []
@@ -259,9 +264,10 @@ async function collectSkillFilesFromExplicitPath(inputPath, sink) {
 }
 
 async function parseSkillName(skillFilePath) {
-    const fallback = path.basename(skillFilePath) === "SKILL.md"
-        ? path.basename(path.dirname(skillFilePath))
-        : path.basename(skillFilePath, path.extname(skillFilePath))
+    const fallback =
+        path.basename(skillFilePath) === "SKILL.md"
+            ? path.basename(path.dirname(skillFilePath))
+            : path.basename(skillFilePath, path.extname(skillFilePath))
 
     try {
         const text = await readFile(skillFilePath, "utf8")
@@ -337,10 +343,7 @@ function inferSkillSourceLabel(skillFilePath, skillName, installedSkillSourceLab
 async function discoverExtensions(configuredPaths) {
     const extensionFiles = new Set()
 
-    for (const rootPath of [
-        path.join(homeDir, ".pi", "agent", "extensions"),
-        path.join(cwd, ".pi", "extensions"),
-    ]) {
+    for (const rootPath of [path.join(homeDir, ".pi", "agent", "extensions"), path.join(cwd, ".pi", "extensions")]) {
         await collectExtensionFilesFromRoot(rootPath, extensionFiles)
     }
 
@@ -404,17 +407,20 @@ async function main() {
         discoverSkills(configuredPaths.skillPaths),
     ])
 
-    notify([
-        `Pi resources: ${extensions.length} extension${extensions.length === 1 ? "" : "s"}, ${packages.length} package${packages.length === 1 ? "" : "s"}, ${skills.names.length} skill${skills.names.length === 1 ? "" : "s"}`,
-        formatIndentedSection("Extensions", extensions),
-        formatIndentedSection("Packages", packages),
-        formatGroupedSection("Skills", skills.groups),
-    ].join("\n"), "warning")
+    emitHookMessage(
+        [
+            `Pi resources: ${extensions.length} extension${extensions.length === 1 ? "" : "s"}, ${packages.length} package${packages.length === 1 ? "" : "s"}, ${skills.names.length} skill${skills.names.length === 1 ? "" : "s"}`,
+            formatIndentedSection("Extensions", extensions),
+            formatIndentedSection("Packages", packages),
+            formatGroupedSection("Skills", skills.groups),
+        ].join("\n"),
+        "info",
+    )
 }
 
 main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error)
-    notify(`Pi resources: ${message}`, "warning")
+    emitHookMessage(`Pi resources: ${message}`, "info")
     console.error(message)
     process.exitCode = 1
 })

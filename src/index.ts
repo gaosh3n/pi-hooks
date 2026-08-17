@@ -390,9 +390,8 @@ type HookStatusSink = {
     setStatus(key: string, text: string | undefined): void
 }
 
-type HookSessionManager = {
-    appendCustomMessageEntry(customType: string, content: unknown, display: boolean, details?: unknown): void
-}
+type HookCustomMessage = Parameters<ExtensionAPI["sendMessage"]>[0]
+type HookMessageSender = (message: HookCustomMessage) => void
 
 type HookRunRecord = {
     id: string
@@ -401,7 +400,7 @@ type HookRunRecord = {
     startedAt: number
     displayOrder: number
     /** Live session sink handle for durable operator-log writes; not part of persisted run state. */
-    sessionManager: HookSessionManager | undefined
+    messageSender: HookMessageSender | undefined
 }
 
 type HookRunStatus = "running" | "completed" | "failed" | "blocked" | "stopped"
@@ -580,7 +579,7 @@ let nextHookRunDisplayOrder = 0
 let finalizedHookRuns = new Map<string, FinalizedHookRun>()
 let lastHookNotifySink: HookNotifySink | undefined
 let lastHookStatusSink: HookStatusSink | undefined
-let lastHookSessionManager: HookSessionManager | undefined
+let lastHookMessageSender: HookMessageSender | undefined
 let hookInvalidStdoutCounts = new Map<string, number>()
 let hookInvalidStdoutNotified = new Set<string>()
 const HOOK_INVALID_STDOUT_NOTIFY_THRESHOLD = 2
@@ -693,9 +692,9 @@ export default function setup(pi: ExtensionAPI) {
         hookInvalidStdoutCounts.clear()
         hookInvalidStdoutNotified.clear()
         lastHookStatusSink = getHookStatusSink(ctx.ui)
-        lastHookSessionManager = getHookSessionManager(
-            (ctx as ExtensionContext & { sessionManager?: unknown }).sessionManager,
-        )
+        lastHookMessageSender = (message) => {
+            pi.sendMessage(message)
+        }
         updateHookStatusSurface(ctx.ui)
         dispatchSessionStartHooks(event, ctx)
     })
@@ -813,7 +812,7 @@ export default function setup(pi: ExtensionAPI) {
         hookInvalidStdoutNotified.clear()
         lastHookNotifySink = undefined
         lastHookStatusSink = undefined
-        lastHookSessionManager = undefined
+        lastHookMessageSender = undefined
         nextHookRunDisplayOrder = 0
         dispatchSessionShutdownHooks(event, ctx, registryAtShutdown)
     })
@@ -1181,14 +1180,6 @@ function getHookStatusSink(value: unknown): HookStatusSink | undefined {
     return typeof value.setStatus === "function" ? (value as HookStatusSink) : undefined
 }
 
-function getHookSessionManager(value: unknown): HookSessionManager | undefined {
-    if (typeof value !== "object" || value === null || !("appendCustomMessageEntry" in value)) {
-        return undefined
-    }
-
-    return typeof value.appendCustomMessageEntry === "function" ? (value as HookSessionManager) : undefined
-}
-
 function isStaleContextError(error: unknown) {
     return error instanceof Error && /stale/i.test(error.message)
 }
@@ -1243,17 +1234,21 @@ function summarizeHookRun(run: FinalizedHookRun) {
     return `Hook ${run.eventName} ${run.status}${run.reason === undefined ? "" : `: ${run.reason}`}`
 }
 
-function appendHookRunOperatorLog(sessionManager: HookSessionManager | undefined, run: FinalizedHookRun) {
-    if (sessionManager === undefined) {
+function sendHookOperatorMessage(messageSender: HookMessageSender | undefined, message: HookCustomMessage) {
+    if (messageSender === undefined) {
         return
     }
 
-    sessionManager.appendCustomMessageEntry(
-        HOOK_RUN_MESSAGE_TYPE,
-        summarizeHookRun(run),
-        false,
-        serializeJsonValue(run),
-    )
+    messageSender(message)
+}
+
+function appendHookRunOperatorLog(messageSender: HookMessageSender | undefined, run: FinalizedHookRun) {
+    sendHookOperatorMessage(messageSender, {
+        customType: HOOK_RUN_MESSAGE_TYPE,
+        content: summarizeHookRun(run),
+        display: true,
+        details: serializeJsonValue(run),
+    })
 }
 
 function reportWarning(message: string, options: { notifyUi?: unknown; level?: HookNotifyLevel } = {}) {
@@ -1324,7 +1319,7 @@ function routeHookStderrEnvelope(
     parsed: { kind: "valid"; prefix: string; channel: HookStderrChannel; envelope: HookScriptNotifyEnvelope },
     options: {
         notifyUi?: unknown
-        sessionManager?: HookSessionManager | undefined
+        messageSender?: HookMessageSender | undefined
         runId?: string | undefined
         eventName?: string | undefined
     },
@@ -1336,12 +1331,12 @@ function routeHookStderrEnvelope(
     }
 
     // channel === "msg" -> durable operator-log seam
-    const sessionManager = options.sessionManager ?? lastHookSessionManager
-    if (sessionManager === undefined) {
+    const messageSender = options.messageSender ?? lastHookMessageSender
+    if (messageSender === undefined) {
         return
     }
 
-    const details: Record<string, unknown> = {
+    const details: JsonObject = {
         level: envelope.level ?? "info",
         message: envelope.message,
     }
@@ -1352,13 +1347,18 @@ function routeHookStderrEnvelope(
         details.runId = options.runId
     }
 
-    sessionManager.appendCustomMessageEntry(HOOK_NOTIFY_MESSAGE_TYPE, envelope.message, false, details)
+    sendHookOperatorMessage(messageSender, {
+        customType: HOOK_NOTIFY_MESSAGE_TYPE,
+        content: envelope.message,
+        display: true,
+        details,
+    })
 }
 
 function consumeHookStderrChunk(options: {
     chunk: string
     notifyUi?: unknown
-    sessionManager?: HookSessionManager | undefined
+    messageSender?: HookMessageSender | undefined
     runId?: string | undefined
     eventName?: string | undefined
     buffer: { partialLine: string; passthrough: string[] }
@@ -1385,7 +1385,7 @@ function consumeHookStderrChunk(options: {
 
 function finalizeHookStderrBuffer(options: {
     notifyUi?: unknown
-    sessionManager?: HookSessionManager | undefined
+    messageSender?: HookMessageSender | undefined
     runId?: string | undefined
     eventName?: string | undefined
     buffer: { partialLine: string; passthrough: string[] }
@@ -1427,7 +1427,7 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
         lastHookStatusSink = statusSink
     }
 
-    const sessionManager = lastHookSessionManager
+    const messageSender = lastHookMessageSender
 
     const displayOrder = nextHookRunDisplayOrder
     nextHookRunDisplayOrder += 1
@@ -1443,7 +1443,7 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
         statusMessage: options.statusMessage,
         startedAt,
         displayOrder,
-        sessionManager,
+        messageSender,
     }
 
     activeHookRuns.set(run.id, run)
@@ -1484,7 +1484,7 @@ function finishHookRun(
     }
     finalizedHookRuns.set(runId, finalizedRun)
     updateHookStatusSurface()
-    appendHookRunOperatorLog(activeRun.sessionManager, finalizedRun)
+    appendHookRunOperatorLog(activeRun.messageSender, finalizedRun)
     notifyOnFinalize(finalizedRun)
 }
 
@@ -2409,7 +2409,7 @@ async function runCommandHook(options: {
             consumeHookStderrChunk({
                 chunk: Buffer.from(chunk).toString("utf8"),
                 notifyUi: options.notifyUi,
-                sessionManager: lastHookSessionManager,
+                messageSender: lastHookMessageSender,
                 runId: hookRunId,
                 eventName: options.payload.event,
                 buffer: stderrBuffer,
@@ -2436,7 +2436,7 @@ async function runCommandHook(options: {
         const stdout = Buffer.concat(stdoutChunks).toString("utf8")
         finalizeHookStderrBuffer({
             notifyUi: options.notifyUi,
-            sessionManager: lastHookSessionManager,
+            messageSender: lastHookMessageSender,
             runId: hookRunId,
             eventName: options.payload.event,
             buffer: stderrBuffer,

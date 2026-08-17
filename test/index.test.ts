@@ -4499,7 +4499,10 @@ describe("pi hooks loader", () => {
                 },
                 systemPrompt: "You are Pi. -> first -> second",
             })
-            expect(sendMessage).not.toHaveBeenCalled()
+            const nonOperatorMessages = sendMessage.mock.calls.filter(
+                (call) => call[0]?.customType !== "pi-hooks-hook-run",
+            )
+            expect(nonOperatorMessages).toHaveLength(0)
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
@@ -4656,7 +4659,10 @@ describe("pi hooks loader", () => {
                 },
                 systemPrompt: "You are Pi. -> first -> second",
             })
-            expect(sendMessage).not.toHaveBeenCalled()
+            const nonOperatorMessages = sendMessage.mock.calls.filter(
+                (call) => call[0]?.customType !== "pi-hooks-hook-run",
+            )
+            expect(nonOperatorMessages).toHaveLength(0)
             expect(warn).toHaveBeenCalledWith(
                 expect.stringContaining("Ignoring invalid hook stdout for before_agent_start"),
             )
@@ -8118,6 +8124,66 @@ describe("pi hooks loader", () => {
             expect(registerMessageRenderer).toHaveBeenCalledWith("pi-hooks-hook-run", expect.any(Function))
         })
 
+        it("sends the durable hook-run operator log through the live custom-message seam", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        turn_start: [{ hooks: [{ type: "command", command: "true" }] }],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                turnStart?.(
+                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                    expect(sendMessage).toHaveBeenCalledWith(
+                        expect.objectContaining({
+                            customType: "pi-hooks-hook-run",
+                            content: "Hook turn_start completed",
+                            display: true,
+                            details: expect.objectContaining({
+                                eventName: "turn_start",
+                                status: "completed",
+                                entries: [],
+                            }),
+                        }),
+                    )
+                })
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
+        })
+
         it("appends one durable operator-log entry when an observe-only hook run finalizes", async () => {
             const homeDir = await makeTempHome()
             const projectDir = join(homeDir, "workspace", "demo")
@@ -8140,7 +8206,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8161,19 +8227,22 @@ describe("pi hooks loader", () => {
 
                 await vi.waitFor(() => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
-                    expect(sessionManager.appendCustomMessageEntry).toHaveBeenCalledTimes(1)
-                    expect(sessionManager.appendCustomMessageEntry).toHaveBeenCalledWith(
-                        "pi-hooks-hook-run",
-                        "Hook turn_start completed",
-                        false,
+                    expect(sendMessage).toHaveBeenCalledTimes(1)
+                    expect(sendMessage).toHaveBeenCalledWith(
                         expect.objectContaining({
-                            eventName: "turn_start",
-                            status: "completed",
-                            entries: [],
+                            customType: "pi-hooks-hook-run",
+                            content: "Hook turn_start completed",
+                            display: true,
+                            details: expect.objectContaining({
+                                eventName: "turn_start",
+                                status: "completed",
+                                entries: [],
+                            }),
                         }),
                     )
                 })
 
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
                 expect(ui.notify).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome
@@ -8288,7 +8357,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8307,7 +8376,7 @@ describe("pi hooks loader", () => {
 
                 await vi.waitFor(() => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
-                    expect(sessionManager.appendCustomMessageEntry).toHaveBeenCalledTimes(1)
+                    expect(sendMessage).toHaveBeenCalledTimes(1)
                     expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("Hook tool_call blocked"), "warning")
                 })
 
@@ -8316,8 +8385,9 @@ describe("pi hooks loader", () => {
                 )
                 expect(blockedNotifyIndex).toBeGreaterThanOrEqual(0)
                 const blockedNotifyOrder = ui.notify.mock.invocationCallOrder[blockedNotifyIndex]!
-                const appendOrder = sessionManager.appendCustomMessageEntry.mock.invocationCallOrder[0]!
-                expect(appendOrder).toBeLessThan(blockedNotifyOrder)
+                const sendOrder = sendMessage.mock.invocationCallOrder[0]!
+                expect(sendOrder).toBeLessThan(blockedNotifyOrder)
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
@@ -8332,6 +8402,79 @@ describe("pi hooks loader", () => {
             setup(pi)
 
             expect(registerMessageRenderer).toHaveBeenCalledWith("pi-hooks-hook-notify", expect.any(Function))
+        })
+
+        it("routes PI_HOOK_MSG from resources_discover through the live custom-message seam", async () => {
+            const homeDir = await makeTempHome()
+            const projectDir = join(homeDir, "workspace", "demo")
+
+            await mkdir(join(projectDir, ".pi"), { recursive: true })
+            const envelope = JSON.stringify({ message: "startup durable note", level: "info" })
+            await writeFile(
+                join(projectDir, ".pi", "hooks.json"),
+                JSON.stringify({
+                    hooks: {
+                        resources_discover: [
+                            {
+                                matcher: "startup|reload",
+                                hooks: [
+                                    {
+                                        type: "command",
+                                        command: `printf 'PI_HOOK_MSG:${envelope}\\n' 1>&2`,
+                                        timeout: 5000,
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                }),
+            )
+
+            const canonicalHomeDir = await realpath(homeDir)
+            const canonicalProjectDir = await realpath(projectDir)
+            const previousHome = process.env.HOME
+            const previousCwd = process.cwd()
+            process.env.HOME = canonicalHomeDir
+            process.chdir(canonicalHomeDir)
+
+            try {
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
+                setup(pi)
+                const ui = createUiDouble()
+                const sessionManager = createSessionManagerDouble()
+                const sessionStart = getSessionStartHandler(handlers)
+                const resourcesDiscover = getRuntimeHandler<ResourcesDiscoverEvent>(handlers, "resources_discover")
+
+                await sessionStart?.(
+                    { type: "session_start", reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await resourcesDiscover?.(
+                    { type: "resources_discover", cwd: canonicalProjectDir, reason: "startup" },
+                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
+                )
+
+                await vi.waitFor(() => {
+                    expect(getFinalizedHookRuns()).toHaveLength(1)
+                    expect(sendMessage).toHaveBeenCalledWith(
+                        expect.objectContaining({
+                            customType: "pi-hooks-hook-notify",
+                            content: "startup durable note",
+                            display: true,
+                            details: expect.objectContaining({
+                                level: "info",
+                                message: "startup durable note",
+                                eventName: "resources_discover",
+                                runId: expect.any(String),
+                            }),
+                        }),
+                    )
+                })
+            } finally {
+                process.env.HOME = previousHome
+                process.chdir(previousCwd)
+            }
         })
 
         it("routes two same-level info PI_HOOK_MSG envelopes to two distinct durable entries (no supersession)", async () => {
@@ -8368,7 +8511,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8389,20 +8532,18 @@ describe("pi hooks loader", () => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
                 })
 
-                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
-                    (call) => call[0] === "pi-hooks-hook-notify",
-                )
+                const msgEntries = sendMessage.mock.calls
+                    .map((call) => call[0])
+                    .filter((message) => message?.customType === "pi-hooks-hook-notify")
                 expect(msgEntries).toHaveLength(2)
-                expect(msgEntries[0]![1]).toBe("first info note")
-                expect(msgEntries[1]![1]).toBe("second info note")
-                expect(msgEntries[0]![2]).toBe(false)
-                expect(msgEntries[1]![2]).toBe(false)
-                // distinct invocations (content differs), proving the second did not overwrite the first
-                expect(msgEntries[0]![1]).not.toBe(msgEntries[1]![1])
-
-                // level preserved in details
-                expect(msgEntries[0]![3]).toMatchObject({ level: "info", message: "first info note" })
-                expect(msgEntries[1]![3]).toMatchObject({ level: "info", message: "second info note" })
+                expect(msgEntries[0]!.content).toBe("first info note")
+                expect(msgEntries[1]!.content).toBe("second info note")
+                expect(msgEntries[0]!.display).toBe(true)
+                expect(msgEntries[1]!.display).toBe(true)
+                expect(msgEntries[0]!.content).not.toBe(msgEntries[1]!.content)
+                expect(msgEntries[0]!.details).toMatchObject({ level: "info", message: "first info note" })
+                expect(msgEntries[1]!.details).toMatchObject({ level: "info", message: "second info note" })
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
 
                 // the two info notices must NOT route to ephemeral notify (the supersession-prone seam)
                 expect(ui.notify).not.toHaveBeenCalledWith("first info note", expect.anything())
@@ -8445,7 +8586,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8468,11 +8609,12 @@ describe("pi hooks loader", () => {
 
                 // ephemeral: routed to notify
                 expect(ui.notify).toHaveBeenCalledWith("ephemeral notice", "info")
-                // NOT durable: no pi-hooks-hook-notify durable entry
-                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
-                    (call) => call[0] === "pi-hooks-hook-notify",
-                )
+                // NOT durable: no live durable custom message and no direct append
+                const msgEntries = sendMessage.mock.calls
+                    .map((call) => call[0])
+                    .filter((message) => message?.customType === "pi-hooks-hook-notify")
                 expect(msgEntries).toHaveLength(0)
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
@@ -8511,7 +8653,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8537,11 +8679,11 @@ describe("pi hooks loader", () => {
                     expect.stringContaining("Ignoring invalid hook stderr msg"),
                     "warning",
                 )
-                // NOT durable
-                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
-                    (call) => call[0] === "pi-hooks-hook-notify",
-                )
+                const msgEntries = sendMessage.mock.calls
+                    .map((call) => call[0])
+                    .filter((message) => message?.customType === "pi-hooks-hook-notify")
                 expect(msgEntries).toHaveLength(0)
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
@@ -8581,7 +8723,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8602,11 +8744,13 @@ describe("pi hooks loader", () => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
                 })
 
-                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
-                    (call) => call[0] === "pi-hooks-hook-notify",
-                )
+                const msgEntries = sendMessage.mock.calls
+                    .map((call) => call[0])
+                    .filter((message) => message?.customType === "pi-hooks-hook-notify")
                 expect(msgEntries).toHaveLength(1)
-                expect(msgEntries[0]![3]).toMatchObject({ level: "info", message: "bare msg" })
+                expect(msgEntries[0]!.display).toBe(true)
+                expect(msgEntries[0]!.details).toMatchObject({ level: "info", message: "bare msg" })
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
@@ -8646,7 +8790,7 @@ describe("pi hooks loader", () => {
             process.chdir(canonicalHomeDir)
 
             try {
-                const { pi, handlers } = createExtensionApiDouble()
+                const { pi, handlers, sendMessage } = createExtensionApiDouble()
                 setup(pi)
                 const ui = createUiDouble()
                 const sessionManager = createSessionManagerDouble()
@@ -8667,16 +8811,18 @@ describe("pi hooks loader", () => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
                 })
 
-                const msgEntries = sessionManager.appendCustomMessageEntry.mock.calls.filter(
-                    (call) => call[0] === "pi-hooks-hook-notify",
-                )
+                const msgEntries = sendMessage.mock.calls
+                    .map((call) => call[0])
+                    .filter((message) => message?.customType === "pi-hooks-hook-notify")
                 expect(msgEntries).toHaveLength(1)
-                expect(msgEntries[0]![3]).toMatchObject({
+                expect(msgEntries[0]!.display).toBe(true)
+                expect(msgEntries[0]!.details).toMatchObject({
                     level: "warning",
                     message: "associated msg",
                     eventName: "turn_start",
                     runId: expect.any(String),
                 })
+                expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome
                 process.chdir(previousCwd)
