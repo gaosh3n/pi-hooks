@@ -7,10 +7,10 @@ import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const checkerPath = path.join(__dirname, "check-pi-package-updates.mjs")
-const HOOK_NOTIFY_PREFIX = "PI_HOOK_NOTIFY:"
+const HOOK_MSG_PREFIX = "PI_HOOK_MSG:"
 
-function notify(message, level = "info") {
-    process.stderr.write(`${HOOK_NOTIFY_PREFIX}${JSON.stringify({ message, level })}\n`)
+function emitHookMessage(message, level = "info") {
+    process.stderr.write(`${HOOK_MSG_PREFIX}${JSON.stringify({ message, level })}\n`)
 }
 
 function runCommand(command, args, options = {}) {
@@ -74,21 +74,21 @@ async function updatePiPackages() {
 async function main() {
     const before = await checkUpdates()
     if (!before.hasUpdates) {
-        notify("Pi package updates: none available")
+        emitHookMessage("Pi package updates: none available")
         return
     }
 
-    notify(`Pi package updates: ${before.count} available`)
+    emitHookMessage(`Pi package updates: ${before.count} available`)
     for (const update of before.updates) {
         console.error(`- ${formatUpdate(update)}`)
     }
 
-    notify("Pi package updates: running pi update --extensions")
+    emitHookMessage("Pi package updates: running pi update --extensions")
     await updatePiPackages()
 
     const after = await checkUpdates()
     if (after.hasUpdates) {
-        notify(`Pi package updates: ${after.count} still available after update`, "warning")
+        emitHookMessage(`Pi package updates: ${after.count} still available after update`, "warning")
         for (const update of after.updates) {
             console.error(`- ${formatUpdate(update)}`)
         }
@@ -96,12 +96,12 @@ async function main() {
         return
     }
 
-    notify("Pi package updates: up to date")
+    emitHookMessage("Pi package updates: up to date")
 }
 
 main().catch((error) => {
     const message = error instanceof Error ? error.message : String(error)
-    notify(`Pi package updates: ${message}`, "warning")
+    emitHookMessage(`Pi package updates: ${message}`, "warning")
     console.error(message)
     process.exitCode = 1
 })

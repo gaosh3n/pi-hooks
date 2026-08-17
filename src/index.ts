@@ -16,7 +16,7 @@ import type {
     ToolCallEventResult,
     ToolResultEvent,
 } from "@earendil-works/pi-coding-agent"
-import { Text } from "@earendil-works/pi-tui"
+import { Box, Text } from "@earendil-works/pi-tui"
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 type JsonObject = { [key: string]: JsonValue }
@@ -661,11 +661,12 @@ export default function setup(pi: ExtensionAPI) {
         return new Text(String(message.content ?? "Hook run"), 0, 0)
     })
 
-    pi.registerMessageRenderer(HOOK_NOTIFY_MESSAGE_TYPE, (message) => {
-        const details = message.details as { level?: string; message?: string } | undefined
-        const level = details?.level ?? "info"
+    pi.registerMessageRenderer(HOOK_NOTIFY_MESSAGE_TYPE, (message, _state, theme) => {
+        const details = message.details as { message?: string } | undefined
         const text = String(message.content ?? details?.message ?? "Hook notify")
-        return new Text(`[${level}] ${text}`, 0, 0)
+        const box = new Box(1, 1, (content) => content)
+        box.addChild(new Text(theme.fg("dim", text), 0, 0))
+        return box
     })
 
     const ensureBeforeAgentStartSlotHandlers = (slotCount: number) => {
