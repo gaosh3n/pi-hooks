@@ -110,7 +110,7 @@ Per `docs/adr/0004-split-pi-hooks-operational-output-across-dedicated-seams.md`,
 Visible surfaces:
 
 - `ctx.ui.notify(...)` through `safeNotify(...)` for high-signal alerts
-- durable operator-log entries via `pi.sendMessage(..., display:true)` plus a custom renderer, covering both runtime per-run history (ADR 0004, corrected by ADR 0006) and helper-script output (ADR 0005, corrected by ADR 0006)
+- durable operator-log entries via `pi.sendMessage(..., display:true)` plus a custom renderer for helper-script `PI_HOOK_MSG:` output (ADR 0005, corrected by ADR 0006)
 - `ctx.ui.setStatus(...)` for lightweight aggregate in-flight status
 
 Helper-script output has two stderr prefixes (ADR 0005):
@@ -127,15 +127,15 @@ Not part of the visible UI surface in Phase 1:
 Why:
 
 - notifications remain the right seam for configured start messages and notable failed/blocked signals
-- a durable operator log avoids same-level supersession for per-run history and helper-script output
-- aggregate status answers “what is happening now?” separately from durable per-run history
+- a durable operator log avoids same-level supersession for helper-script/operator-authored output that genuinely benefits from persistence
+- aggregate status answers “what is happening now?” separately from durable helper-script/operator-authored output
 - current Pi extension APIs already support this split without Pi core changes
 
 This means the operator-facing visible loop should be:
 
 - a configured `statusMessage` emits one informational notification when its hook starts
 - notable failures and blocks continue to use the same notification path
-- each `HookRunRecord` gets one durable rendered operator-log entry when it finalizes
+- routine `HookRunRecord` completion does **not** emit a durable transcript entry
 - each `PI_HOOK_MSG:` envelope gets one durable rendered operator-log entry (ADR 0005, corrected by ADR 0006)
 - aggregate in-flight hook activity is reflected through `ctx.ui.setStatus(...)`
 - operator-visible warnings/failures must use Pi-native UI surfaces rather than raw console warnings
@@ -153,7 +153,7 @@ Pi Hooks already loads `statusMessage` from config. What exact notification rule
 
 Resolved.
 
-`statusMessage` remains config-owned and emitted through `safeNotify(...)` as a start notification. Per ADR 0004, it is not the source of aggregate `ctx.ui.setStatus(...)` text, and it does not own durable per-run history.
+`statusMessage` remains config-owned and emitted through `safeNotify(...)` as a start notification. Per ADR 0004, it is not the source of aggregate `ctx.ui.setStatus(...)` text, and it does not create durable transcript history.
 
 Rules:
 
@@ -167,14 +167,14 @@ Non-rules:
 
 - do not render per-hook configured `statusMessage` text through `ctx.ui.setStatus(...)`
 - do not notify again when a run completes
-- do not treat start notifications themselves as durable run history; finalization-time operator-log entries own that history
+- do not treat start notifications themselves as durable history; routine completion is intentionally silent unless a helper script emits its own `PI_HOOK_MSG:` output
 - do not let hooks set transient notification text through stdout
 
 Why:
 
 - this preserves the existing configuration key and the `#25` Slice B notify-worthy start behavior
 - it keeps aggregate in-flight status extension-owned rather than hook-text-owned
-- it separates transient start notices from durable per-run history
+- it separates transient start notices from durable helper-script/operator-authored output
 
 ## #6: How should fire-and-forget observe-only hooks appear operationally?
 
@@ -200,7 +200,7 @@ Model:
 - attach warnings/errors/ignored-stdout diagnostics to that run record
 - emit a configured `statusMessage` once at start through `safeNotify(...)`
 - reflect in-flight hook activity through the aggregate `ctx.ui.setStatus(...)` seam while the run is active
-- write one durable operator-log entry when the run finalizes rather than emitting a separate routine-completion notification
+- do not emit routine completion output when the run finalizes; rely on start notifications, failure/block notifications, aggregate status, and any explicit helper-script `PI_HOOK_MSG:` output
 - use notifications only for notable failures such as timeout or repeated malformed semantic-looking stdout on important seams; this threshold is a **notification-layer display gate**, not a classification-layer suppression — the classifier (#25 decision map) always records all classifications (`failed`/`blocked`/`stopped`), and the notifier decides what to surface. `stopped` runs (timeout/abort/shutdown) are non-failures and never notify
 
 Important boundary:
@@ -263,7 +263,7 @@ Mapping rules:
 
 If later debugging needs a little more semantic color, add it as a typed run entry, not as new always-present top-level fields.
 
-This keeps the shared hook-run model lean while staying expressive enough for start notifications, notable failure notifications, one durable per-run operator-log entry at finalization, one durable `PI_HOOK_MSG:` entry per helper-script envelope (ADR 0005, corrected by ADR 0006), and aggregate in-flight status.
+This keeps the shared hook-run model lean while staying expressive enough for start notifications, notable failure notifications, one durable `PI_HOOK_MSG:` entry per helper-script envelope (ADR 0005, corrected by ADR 0006), and aggregate in-flight status.
 
 ## #9: Should hook-run observability stay extension-owned, or do we need Pi core protocol work?
 
@@ -283,7 +283,7 @@ Per ADR 0004, ADR 0005, and ADR 0006, the useful operational loop defined in thi
 Use the current Pi extension surface:
 
 - `ctx.ui.notify(...)` through `safeNotify(...)` for configured start messages and notable failed/blocked signals
-- `pi.sendMessage(..., display:true)` plus a custom renderer for durable operator-log entries, covering runtime per-run finalization (ADR 0004, corrected by ADR 0006) and helper-script `PI_HOOK_MSG:` output (ADR 0005, corrected by ADR 0006)
+- `pi.sendMessage(..., display:true)` plus a custom renderer for durable operator-log entries from helper-script `PI_HOOK_MSG:` output (ADR 0005, corrected by ADR 0006)
 - `ctx.ui.setStatus(...)` for lightweight aggregate in-flight status
 
 Helper-script prefixes (ADR 0005):
@@ -322,7 +322,7 @@ The smallest shippable slice that proves the architecture is the ADR 0004 Phase 
 2. track both awaited semantic hooks and fire-and-forget observe-only hooks through that same model
 3. emit configured `statusMessage` values through `safeNotify(...)` at run start
 4. keep enough internal run state to finalize background runs correctly
-5. write one durable operator-log entry per `HookRunRecord` at finalization
+5. keep routine `HookRunRecord` completion internal rather than writing a durable operator-log entry
 6. expose aggregate in-flight activity through `ctx.ui.setStatus(...)`
 7. keep notifications for the existing `#25` Slice B notify-worthy set rather than using them as the only visible seam
 
@@ -348,7 +348,7 @@ Implementation order inside the slice:
 2. centralize run creation/finalization in `runCommandHook(...)`
 3. record entries instead of only warning text
 4. route configured start messages through `safeNotify(...)`
-5. append finalization-time durable operator-log entries
+5. route only justified durable output — such as helper-script `PI_HOOK_MSG:` envelopes — onto the custom-message seam
 6. maintain aggregate running state through `ctx.ui.setStatus(...)`
 
 With this ticket resolved, the path to implementation is clear and the decision map is done.

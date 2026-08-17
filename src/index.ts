@@ -399,8 +399,6 @@ type HookRunRecord = {
     statusMessage: string | undefined
     startedAt: number
     displayOrder: number
-    /** Live session sink handle for durable operator-log writes; not part of persisted run state. */
-    messageSender: HookMessageSender | undefined
 }
 
 type HookRunStatus = "running" | "completed" | "failed" | "blocked" | "stopped"
@@ -428,7 +426,6 @@ const HOOK_PROTOCOL_VERSION = 1 as const
 const SESSION_START_NOTIFICATION_DELAY_MS = 100
 const HOOK_STDERR_NOTIFY_PREFIX = "PI_HOOK_NOTIFY:"
 const HOOK_STDERR_MSG_PREFIX = "PI_HOOK_MSG:"
-const HOOK_RUN_MESSAGE_TYPE = "pi-hooks-hook-run"
 const HOOK_NOTIFY_MESSAGE_TYPE = "pi-hooks-hook-notify"
 const HOOK_STATUS_KEY = "pi-hooks"
 const SEMANTIC_STDOUT_EVENT_NAMES = new Set(["input", "before_agent_start", "tool_call", "tool_result"])
@@ -656,10 +653,6 @@ function compileBeforeAgentStartHookSlots(registry: HookRegistry): BeforeAgentSt
 
 export default function setup(pi: ExtensionAPI) {
     let registeredBeforeAgentStartSlotCount = 0
-
-    pi.registerMessageRenderer(HOOK_RUN_MESSAGE_TYPE, (message) => {
-        return new Text(String(message.content ?? "Hook run"), 0, 0)
-    })
 
     pi.registerMessageRenderer(HOOK_NOTIFY_MESSAGE_TYPE, (message, _state, theme) => {
         const details = message.details as { message?: string } | undefined
@@ -1231,25 +1224,12 @@ function updateHookStatusSurface(statusUi?: unknown) {
     return safeSetStatus(statusSink, activeHookRuns.size === 0 ? undefined : `hooks: ${activeHookRuns.size} running`)
 }
 
-function summarizeHookRun(run: FinalizedHookRun) {
-    return `Hook ${run.eventName} ${run.status}${run.reason === undefined ? "" : `: ${run.reason}`}`
-}
-
 function sendHookOperatorMessage(messageSender: HookMessageSender | undefined, message: HookCustomMessage) {
     if (messageSender === undefined) {
         return
     }
 
     messageSender(message)
-}
-
-function appendHookRunOperatorLog(messageSender: HookMessageSender | undefined, run: FinalizedHookRun) {
-    sendHookOperatorMessage(messageSender, {
-        customType: HOOK_RUN_MESSAGE_TYPE,
-        content: summarizeHookRun(run),
-        display: true,
-        details: serializeJsonValue(run),
-    })
 }
 
 function reportWarning(message: string, options: { notifyUi?: unknown; level?: HookNotifyLevel } = {}) {
@@ -1428,8 +1408,6 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
         lastHookStatusSink = statusSink
     }
 
-    const messageSender = lastHookMessageSender
-
     const displayOrder = nextHookRunDisplayOrder
     nextHookRunDisplayOrder += 1
 
@@ -1444,7 +1422,6 @@ function startHookRun(options: { eventName: string; statusMessage: string | unde
         statusMessage: options.statusMessage,
         startedAt,
         displayOrder,
-        messageSender,
     }
 
     activeHookRuns.set(run.id, run)
@@ -1485,7 +1462,6 @@ function finishHookRun(
     }
     finalizedHookRuns.set(runId, finalizedRun)
     updateHookStatusSurface()
-    appendHookRunOperatorLog(activeRun.messageSender, finalizedRun)
     notifyOnFinalize(finalizedRun)
 }
 

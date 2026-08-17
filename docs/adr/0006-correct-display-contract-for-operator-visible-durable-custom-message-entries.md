@@ -8,9 +8,16 @@ Accepted
 
 ## Context
 
-ADR 0004 introduced a durable operator-log seam for runtime hook output. ADR 0005 extended that durable seam to helper-script output via `PI_HOOK_MSG:`.
+ADR 0004 introduced the seam split between ephemeral notify, durable custom-message output, and aggregate status. ADR 0005 extended the durable seam to helper-script output via `PI_HOOK_MSG:`.
 
-Both ADRs originally made the same display-contract claim:
+At the time this ADR was accepted, the same live-delivery/display-contract bug affected two durable custom-message uses:
+
+- runtime-owned `pi-hooks-hook-run` completion summaries
+- helper-script-owned `pi-hooks-hook-notify` messages
+
+The runtime-owned completion summaries were later removed as trivial routine output, but the delivery/display findings in this ADR remain relevant to helper-script durable messages and to any future operator-visible durable custom-message use.
+
+Both earlier ADRs originally made the same display-contract claim:
 
 - persist operator-visible durable output with `appendCustomMessageEntry(..., display:false)`
 - register a custom message renderer
@@ -68,7 +75,7 @@ So direct `appendCustomMessageEntry(...)` writes can produce exactly the replay-
 The accepted architecture remains sound:
 
 - split output across **ephemeral** and **durable** seams
-- expose both seams to **internal runtime code** and **helper scripts**
+- keep helper scripts able to reach both seams, while runtime-owned output can choose the seam that fits its signal level
 
 The bug is narrower: ADR 0004, ADR 0005, and the initial version of ADR 0006 recorded the wrong live-delivery contract for the operator-visible durable `custom_message` path.
 
@@ -83,11 +90,11 @@ Do **not** write operator-visible durable `custom_message` entries directly thro
 
 Direct `appendCustomMessageEntry(...)` writes remain a persistence primitive, but they are not the correct live-delivery seam for operator-visible `custom_message` entries in Pi.
 
-Apply this correction to both existing durable operator-visible custom message types:
+Apply this correction to any operator-visible durable custom-message entry that should appear inline on first delivery.
 
-1. `pi-hooks-hook-run`
-   - the ADR 0004 runtime durable operator-log entry
-2. `pi-hooks-hook-notify`
+In the current implementation, that means the helper-script durable message type:
+
+1. `pi-hooks-hook-notify`
    - the ADR 0005 helper-script durable operator-notify entry emitted from `PI_HOOK_MSG:`
 
 This ADR does **not** change the broader architecture.
@@ -130,11 +137,11 @@ Because the architecture was not what failed.
 
 What failed was a narrower assumption about how Pi delivers and renders `custom_message` entries in the interactive TUI. The persistence behavior shipped exactly as designed; the first-run live visibility behavior did not, because the accepted ADRs recorded the wrong live-delivery and display contract.
 
-### Why apply the correction to both `pi-hooks-hook-run` and `pi-hooks-hook-notify`?
+### Why keep this correction after removing `pi-hooks-hook-run`?
 
-Because the same live-delivery error affects both.
+Because the underlying Pi contract did not change.
 
-Fixing only `pi-hooks-hook-notify` would knowingly leave ADR 0004's durable runtime operator log on the same replay-only delivery seam.
+Helper-script durable output still uses operator-visible `custom_message` delivery, and any future runtime-owned durable custom message would hit the same live-delivery/display rule. Removing routine runtime completion summaries narrows the current scope of this ADR, but does not invalidate the contract it records.
 
 ### Why keep the `custom_message` seam rather than switching to `appendCustomEntry(...)`?
 
@@ -146,7 +153,6 @@ This ADR corrects the live-delivery and display contract of that seam; it does n
 
 ### Positive
 
-- durable runtime hook output becomes interactively visible on first delivery where ADR 0004 said it would be visible
 - durable helper-script output from `PI_HOOK_MSG:` becomes interactively visible on first delivery where ADR 0005 said it would be visible
 - replay behavior and first-run live behavior now align on the same operator-visible custom-message path
 - the accepted architecture stays intact; only the mistaken live-delivery and display contract is corrected
@@ -170,16 +176,13 @@ Those may become later ADRs if needed. This ADR only corrects the current operat
 
 ## Implementation notes
 
-- route ADR 0004's `pi-hooks-hook-run` durable operator-log entry through `pi.sendMessage(...)` with `display:true`
 - route ADR 0005's `pi-hooks-hook-notify` durable operator-log entry through `pi.sendMessage(...)` with `display:true`
-- stop relying on direct `appendCustomMessageEntry(...)` writes for first-run operator-visible delivery of those two custom-message types
-- keep the existing custom message renderers for both types unless later UX work justifies richer rendering
+- stop relying on direct `appendCustomMessageEntry(...)` writes for first-run operator-visible delivery of helper-script durable custom messages
+- keep the existing custom message renderer for `pi-hooks-hook-notify` unless later UX work justifies richer rendering
 - re-run interactive verification specifically against:
   - `resources_discover` / `.pi/pi-hooks/list-pi-resources.mjs`
-  - runtime `HookRunRecord` finalization output
-- confirm both properties for both custom-message types after the change:
+- confirm both properties for `pi-hooks-hook-notify` after the change:
   - `pi-hooks-hook-notify` entries are delivered live on first run, persist durably to the session JSONL, and remain inline-visible in the interactive transcript/TUI
-  - `pi-hooks-hook-run` entries are delivered live on first run, persist durably to the session JSONL, and remain inline-visible in the interactive transcript/TUI
 
 ## References
 

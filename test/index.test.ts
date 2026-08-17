@@ -4499,10 +4499,7 @@ describe("pi hooks loader", () => {
                 },
                 systemPrompt: "You are Pi. -> first -> second",
             })
-            const nonOperatorMessages = sendMessage.mock.calls.filter(
-                (call) => call[0]?.customType !== "pi-hooks-hook-run",
-            )
-            expect(nonOperatorMessages).toHaveLength(0)
+            expect(sendMessage).not.toHaveBeenCalled()
         } finally {
             process.env.HOME = previousHome
             process.chdir(previousCwd)
@@ -4659,10 +4656,7 @@ describe("pi hooks loader", () => {
                 },
                 systemPrompt: "You are Pi. -> first -> second",
             })
-            const nonOperatorMessages = sendMessage.mock.calls.filter(
-                (call) => call[0]?.customType !== "pi-hooks-hook-run",
-            )
-            expect(nonOperatorMessages).toHaveLength(0)
+            expect(sendMessage).not.toHaveBeenCalled()
             expect(warn).toHaveBeenCalledWith(
                 expect.stringContaining("Ignoring invalid hook stdout for before_agent_start"),
             )
@@ -8115,76 +8109,8 @@ describe("pi hooks loader", () => {
         })
     })
 
-    describe("operator output seams (ADR 0004 phase 1)", () => {
-        it("registers a custom message renderer for durable hook-run log entries", () => {
-            const { pi, registerMessageRenderer } = createExtensionApiDouble()
-
-            setup(pi)
-
-            expect(registerMessageRenderer).toHaveBeenCalledWith("pi-hooks-hook-run", expect.any(Function))
-        })
-
-        it("sends the durable hook-run operator log through the live custom-message seam", async () => {
-            const homeDir = await makeTempHome()
-            const projectDir = join(homeDir, "workspace", "demo")
-
-            await mkdir(join(projectDir, ".pi"), { recursive: true })
-            await writeFile(
-                join(projectDir, ".pi", "hooks.json"),
-                JSON.stringify({
-                    hooks: {
-                        turn_start: [{ hooks: [{ type: "command", command: "true" }] }],
-                    },
-                }),
-            )
-
-            const canonicalHomeDir = await realpath(homeDir)
-            const canonicalProjectDir = await realpath(projectDir)
-            const previousHome = process.env.HOME
-            const previousCwd = process.cwd()
-            process.env.HOME = canonicalHomeDir
-            process.chdir(canonicalHomeDir)
-
-            try {
-                const { pi, handlers, sendMessage } = createExtensionApiDouble()
-                setup(pi)
-                const ui = createUiDouble()
-                const sessionManager = createSessionManagerDouble()
-                const sessionStart = getSessionStartHandler(handlers)
-                const turnStart = getRuntimeHandler<TurnStartEvent>(handlers, "turn_start")
-
-                await sessionStart?.(
-                    { type: "session_start", reason: "startup" },
-                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
-                )
-
-                turnStart?.(
-                    { type: "turn_start", turnIndex: 1, timestamp: 1 },
-                    createExtensionContext(canonicalProjectDir, { ui, sessionManager }),
-                )
-
-                await vi.waitFor(() => {
-                    expect(getFinalizedHookRuns()).toHaveLength(1)
-                    expect(sendMessage).toHaveBeenCalledWith(
-                        expect.objectContaining({
-                            customType: "pi-hooks-hook-run",
-                            content: "Hook turn_start completed",
-                            display: true,
-                            details: expect.objectContaining({
-                                eventName: "turn_start",
-                                status: "completed",
-                                entries: [],
-                            }),
-                        }),
-                    )
-                })
-            } finally {
-                process.env.HOME = previousHome
-                process.chdir(previousCwd)
-            }
-        })
-
-        it("appends one durable operator-log entry when an observe-only hook run finalizes", async () => {
+    describe("hook-run tracking and operator surfaces", () => {
+        it("tracks finalized observe-only hook runs without sending a durable custom message", async () => {
             const homeDir = await makeTempHome()
             const projectDir = join(homeDir, "workspace", "demo")
 
@@ -8227,21 +8153,14 @@ describe("pi hooks loader", () => {
 
                 await vi.waitFor(() => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
-                    expect(sendMessage).toHaveBeenCalledTimes(1)
-                    expect(sendMessage).toHaveBeenCalledWith(
-                        expect.objectContaining({
-                            customType: "pi-hooks-hook-run",
-                            content: "Hook turn_start completed",
-                            display: true,
-                            details: expect.objectContaining({
-                                eventName: "turn_start",
-                                status: "completed",
-                                entries: [],
-                            }),
-                        }),
-                    )
+                    expect(getFinalizedHookRuns()[0]).toMatchObject({
+                        eventName: "turn_start",
+                        status: "completed",
+                        entries: [],
+                    })
                 })
 
+                expect(sendMessage).not.toHaveBeenCalled()
                 expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
                 expect(ui.notify).not.toHaveBeenCalled()
             } finally {
@@ -8318,7 +8237,7 @@ describe("pi hooks loader", () => {
             }
         })
 
-        it("writes the durable operator-log entry before emitting the Slice B failure notification", async () => {
+        it("emits the Slice B failure notification without a durable completion custom message", async () => {
             const homeDir = await makeTempHome()
             const projectDir = join(homeDir, "workspace", "demo")
 
@@ -8376,17 +8295,10 @@ describe("pi hooks loader", () => {
 
                 await vi.waitFor(() => {
                     expect(getFinalizedHookRuns()).toHaveLength(1)
-                    expect(sendMessage).toHaveBeenCalledTimes(1)
                     expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("Hook tool_call blocked"), "warning")
                 })
 
-                const blockedNotifyIndex = ui.notify.mock.calls.findIndex(
-                    (call) => typeof call[0] === "string" && call[0].includes("Hook tool_call blocked"),
-                )
-                expect(blockedNotifyIndex).toBeGreaterThanOrEqual(0)
-                const blockedNotifyOrder = ui.notify.mock.invocationCallOrder[blockedNotifyIndex]!
-                const sendOrder = sendMessage.mock.invocationCallOrder[0]!
-                expect(sendOrder).toBeLessThan(blockedNotifyOrder)
+                expect(sendMessage).not.toHaveBeenCalled()
                 expect(sessionManager.appendCustomMessageEntry).not.toHaveBeenCalled()
             } finally {
                 process.env.HOME = previousHome

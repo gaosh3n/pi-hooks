@@ -8,9 +8,9 @@ Accepted
 
 ## Context
 
-ADR 0004 introduced a durable operator-log seam for `pi-hooks` runtime output. Phase 1 shipped that seam for `HookRunRecord` finalization entries: each finalized hook run writes one durable `pi-hooks-hook-run` custom message entry via `appendCustomMessageEntry(..., display:false)`, rendered inline in the transcript/TUI.
+ADR 0004 introduced a dedicated durable operator-log seam into the `pi-hooks` architecture alongside ephemeral notify and aggregate status seams.
 
-However, ADR 0004 scoped the durable seam to runtime `HookRunRecord` history only. It did **not** give helper scripts a way to reach the durable seam. Today, the only helper-script channel is the `PI_HOOK_NOTIFY:` stderr prefix, which routes parsed envelopes directly to `safeNotify(...)` → `ctx.ui.notify(...)` in `src/index.ts`.
+Helper scripts still needed an explicit way to reach that durable seam. Without that, the only helper-script channel was the `PI_HOOK_NOTIFY:` stderr prefix, which routes parsed envelopes directly to `safeNotify(...)` → `ctx.ui.notify(...)` in `src/index.ts`.
 
 ### Why this is a problem
 
@@ -19,35 +19,35 @@ However, ADR 0004 scoped the durable seam to runtime `HookRunRecord` history onl
 - `info`-level notifications reuse the previous info text node, so a later info message **replaces** the earlier one (literal same-level supersession)
 - `warning`/`error` notifications stack as inline transcript lines but scroll away with chat; they are not durable
 
-So operator-meaningful output from helper scripts (for example `list-pi-resources.mjs` summaries, package-update notices, or any structured helper message) has no durable path today — it is all subject to supersession or loss. This directly defeats the user's stated goal for introducing the durable seam in the first place: a unified operator-output channel where same-level entries do not erase each other, with **both** a durable option and an ephemeral option accessible from **both** internal runtime code and helper scripts.
+So operator-meaningful output from helper scripts (for example `list-pi-resources.mjs` summaries, package-update notices, or any structured helper message) has no durable path today — it is all subject to supersession or loss. This directly defeats the user's stated goal for introducing the durable seam in the first place: a unified operator-output channel where same-level entries do not erase each other, with **both** a durable option and an ephemeral option accessible to helper scripts.
 
 ### What `pi-context-prune` actually does
 
-Re-verified upstream: `pi-context-prune` does **not** solve `ctx.ui.notify` supersession internally — it cannot, that is Pi-core behavior. It keeps `ctx.ui.notify(...)` for small ephemeral command feedback (enabled/disabled/stat echoes) and moves the **heavy, must-persist content** (summaries, indices, stats) onto durable `custom_message` entries that persist to the session JSONL and render inline. Those entries do not supersede because each is a distinct persisted record.
+Re-verified upstream: `pi-context-prune` does **not** solve `ctx.ui.notify` supersession internally — it cannot, that is Pi-core behavior. It keeps `ctx.ui.notify(...)` for small ephemeral command feedback (enabled/disabled/stat echoes) and moves the **heavy, must-persist content** (summaries, indices, stats) onto durable `custom_message` entries that persist to the session JSONL, while its operator-visible interactive surface comes from `ctx.ui.setStatus(...)` / `ctx.ui.setWidget(...)` rather than inline transcript rendering of those persisted `display:false` entries. Those durable entries do not supersede because each is a distinct persisted record.
 
-The unified non-superseding "notification" the user is asking for is therefore the durable seam itself, not `ctx.ui.notify`. ADR 0004 built that seam for runtime history; ADR 0005 extends it to helper-script output.
+The unified non-superseding "notification" the user is asking for is therefore the durable seam itself, not `ctx.ui.notify`. ADR 0005 extends that durable seam to helper-script output.
 
 ## Scope of this ADR
 
-This ADR gives both pi-hooks audiences — internal runtime code and helper scripts — access to **both** operator-output options, mirroring `pi-context-prune`:
+This ADR gives helper scripts access to **both** operator-output options, mirroring `pi-context-prune`:
 
 - an **ephemeral** option (small, transient notices via `ctx.ui.notify(...)`)
 - a **durable** option (persisted `custom_message` entries via the durable operator-log seam)
 
-Internal code already has both via direct API calls (`ctx.ui.notify` for ephemeral, `appendCustomMessageEntry` for durable). Helper scripts only have stderr prefixes as their channel, so this ADR introduces a new durable prefix alongside the existing ephemeral one. It is **not** an attempt to change `ctx.ui.notify` internals (that is Pi-core behavior extensions cannot alter).
+Current runtime-owned operator output deliberately keeps routine `HookRunRecord` completion internal rather than emitting a durable completion message, but helper scripts still need a durable protocol path when they want operator-visible output that persists without supersession. Since helper scripts only have stderr prefixes as their channel, this ADR introduces a new durable prefix alongside the existing ephemeral one. It is **not** an attempt to change `ctx.ui.notify` internals (that is Pi-core behavior extensions cannot alter).
 
 ## Decision
 
 Introduce a **new** stderr prefix, `PI_HOOK_MSG:`, for durable helper-script output. Keep the existing `PI_HOOK_NOTIFY:` prefix ephemeral and unchanged. This preserves backwards compatibility for existing helper scripts while giving new ones opt-in access to the durable seam.
 
 1. **New durable prefix `PI_HOOK_MSG:`**
-   - Parsed `PI_HOOK_MSG:` envelopes are appended as durable custom message entries via `appendCustomMessageEntry(..., display:false, { level, ...details })`
+   - Parsed `PI_HOOK_MSG:` envelopes are delivered as durable custom messages via `pi.sendMessage(..., display:true, { level, ...details })` and persist through Pi's custom-message path (ADR 0006 corrects the live-delivery contract)
    - Payload schema is **identical** to `PI_HOOK_NOTIFY:` (`{ message, level? }`), so authors learn two prefixes, not two payload shapes
-   - Use a dedicated custom type, `pi-hooks-hook-notify`, distinct from the runtime `pi-hooks-hook-run` type
+   - Use a dedicated custom type, `pi-hooks-hook-notify`, for helper-script durable output
    - **One `PI_HOOK_MSG:` envelope → one durable `pi-hooks-hook-notify` entry** (envelopes are the natural unit; they already represent one operator message each)
-   - Preserve the envelope's `level` (`info`/`warning`/`error`, defaulting to `info` if absent) into the entry `details`; surface it in the renderer so the operator can distinguish severity
+   - Preserve the envelope's `level` (`info`/`warning`/`error`, defaulting to `info` if absent) into the entry `details`; the renderer may keep visible presentation minimal while preserving severity for future filtering/debugging
    - Preserve the originating hook command/run association into `details` where available
-   - `level: warning`/`error` is the higher-value use case for the durable channel; info-level ephemeral feedback is better left on `PI_HOOK_NOTIFY:`
+   - `warning`/`error` may be especially high-value durable cases, but `PI_HOOK_MSG:` is available for any helper-script output that should persist without supersession, including `info`-level summaries
 
 2. **Ephemeral prefix `PI_HOOK_NOTIFY:` unchanged**
    - `PI_HOOK_NOTIFY:` keeps its current behavior: ephemeral `ctx.ui.notify(...)` via `safeNotify(...)`
@@ -57,7 +57,7 @@ Introduce a **new** stderr prefix, `PI_HOOK_MSG:`, for durable helper-script out
 
 3. **Renderer**
    - Register a custom message renderer for `pi-hooks-hook-notify` that renders inline in transcript/TUI flow
-   - Render the level (for example via theme color / prefix) and the message text
+   - Render the message text with a minimal, subdued operator-visible treatment; `level` remains available in `details` even if the visible rendering does not show a textual severity prefix
    - Phase 1 keeps this minimal; richer expandable detail is a follow-up
 
 4. **`ctx.ui.notify(...)` retained role**
@@ -73,7 +73,7 @@ Introduce a **new** stderr prefix, `PI_HOOK_MSG:`, for durable helper-script out
 
 This ADR partially supersedes the implicit ADR 0004 default that helper-script output stays on the notify seam. ADR 0004 did not address helper-script output explicitly; its notify/durable boundary left helper-script output on notify by omission. ADR 0005 closes that omission by adding the `PI_HOOK_MSG:` durable prefix.
 
-It does **not** supersede ADR 0004's durable-log or status decisions; those stand. It extends the durable seam's reach to a second audience (helper scripts).
+It does **not** supersede ADR 0004's seam-split or status decisions; those stand. It extends durable-seam access to helper scripts.
 
 ## Non-decisions / unchanged decisions
 
@@ -82,7 +82,7 @@ This ADR does **not** change:
 - the existing `PI_HOOK_NOTIFY:` prefix semantics (still ephemeral); it **adds** the `PI_HOOK_MSG:` prefix rather than altering `PI_HOOK_NOTIFY:`
 - the existing `PI_HOOK_NOTIFY:` payload schema
 - `HookRunRecord` as the runtime per-run state unit
-- ADR 0004's durable-log seam for runtime finalization history
+- routine runtime completion behavior; this ADR does not require a durable completion message for every `HookRunRecord`
 - ADR 0004's status/progress seam
 - the `#25` Slice B notify-worthy event set for ephemeral feedback
 - event matching or hook selection semantics
@@ -104,7 +104,7 @@ The pair's contract, stated in one line so the names do not have to carry it alo
 
 ### Why preserve `level` in details?
 
-`pi-context-prune`'s durable entries are untyped summaries. `pi-hooks`' envelope already carries a `level` field, so pi-hooks can be richer than the reference: severity survives into the durable entry and the renderer can surface it, giving operators a durable leveled log rather than an opaque stream.
+`pi-context-prune`'s durable entries are untyped summaries. `pi-hooks`' envelope already carries a `level` field, so pi-hooks can be richer than the reference: severity survives into the durable entry for debugging, filtering, and future rendering choices even when the initial visible treatment stays deliberately minimal.
 
 ### Why keep `ctx.ui.notify` for the Slice B set?
 
@@ -112,18 +112,17 @@ The pair's contract, stated in one line so the names do not have to carry it alo
 
 ### Why a separate custom type (`pi-hooks-hook-notify`)?
 
-The two durable entry kinds have fundamentally different granularity and content shape:
+Helper-script durable entries have their own granularity and content shape:
 
-- `pi-hooks-hook-run` entries are **one per finalized run** and **structured** (serialized run record with `status`/`reason`/`entries[]`).
 - `pi-hooks-hook-notify` entries are **one per parsed envelope** (potentially many per run, not tied 1:1 to a run) and **leveled** (`info`/`warning`/`error`).
 
-Mixing them into one custom type would force the renderer to branch on "is this a run record or a notify envelope?" via `details`-shape-sniffing — exactly the early-collapse ADR 0002 and ADR 0004 cautioned against. Separate types keep each renderer single-purpose and let future filtering/eviction treat helper-script messages differently from per-run finalization records.
+Giving them a dedicated custom type keeps the renderer single-purpose and leaves room for future runtime-owned durable message types without forcing shape-sniffing inside one renderer.
 
 ## Consequences
 
 ### Positive
 
-- closes the user's stated goal: same-level operator output no longer superseded, for both internal and helper-script output
+- closes the user's stated goal for helper-script/operator-authored durable output: same-level entries no longer supersede one another
 - makes `list-pi-resources.mjs`-style summaries durable and reviewable
 - preserves severity into a durable leveled log
 - keeps notify's legitimate ephemeral role intact
@@ -131,7 +130,7 @@ Mixing them into one custom type would force the renderer to branch on "is this 
 ### Negative / costs
 
 - helper-script authors now have two prefixes to learn; emitting `PI_HOOK_MSG:` when a transient `PI_HOOK_NOTIFY:` was intended leaves durable transcript entries (a docs/discoverability cost, not a correctness cost). Existing `PI_HOOK_NOTIFY:` scripts are unaffected.
-- adds a second custom message type and renderer to maintain
+- adds a helper-script custom message type and renderer to maintain
 - future helper-script output must respect the channel contract: operator-meaningful → `PI_HOOK_MSG:`, genuinely-ephemeral → `PI_HOOK_NOTIFY:`
 - **start `statusMessage` and failed/blocked remain ephemeral by design** (Slice B); an operator who wants a durable start record must emit a `PI_HOOK_MSG:` envelope from the helper script rather than relying on the start `statusMessage` field. This is a deliberate boundary, not an oversight: it mirrors `pi-context-prune`'s coexistence of ephemeral command feedback and durable summaries.
 
@@ -145,8 +144,8 @@ Mixing them into one custom type would force the renderer to branch on "is this 
 
 - Define the exact `pi-hooks-hook-notify` entry shape: `{ level, message, eventName?, runId?, ... }`
 - Add `HOOK_STDERR_MSG_PREFIX = "PI_HOOK_MSG:"` and a parser path parallel to the existing `PI_HOOK_NOTIFY:` parser (or a shared parser parameterized by prefix)
-- Extend the renderer to show level (for example color/prefix)
-- Update `docs/decision-maps/pi-hooks-operational-loop.md` so its durable-seam scope explicitly includes `PI_HOOK_MSG:` output, not just `HookRunRecord` finalization
+- Keep severity preserved in `details`; revisit richer visible level rendering only if later UX work justifies it
+- Update `docs/decision-maps/pi-hooks-operational-loop.md` so its durable-seam scope explicitly includes `PI_HOOK_MSG:` output
 - Re-run the runtime smoke against a helper script that emits multiple same-level `PI_HOOK_MSG:` envelopes to confirm non-supersession at runtime — concretely, emit two same-level `info` envelopes in a row and assert **two distinct durable entries** land in the session JSONL (not one replacing the other). This is the runtime proof of the user's same-level non-supersession goal.
 - Document the two prefixes in the helper-script protocol docs so authors discover the durable channel
 

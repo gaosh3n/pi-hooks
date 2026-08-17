@@ -63,13 +63,11 @@ Instead, it will split operator-visible output across three seams:
    - Phase 1 preserves the notify-worthy event set already established by `#25` Slice B: failed, blocked, and start `statusMessage` events
 
 2. **Durable operator-log seam**
-   - Add durable operator-visible entries keyed to `HookRunRecord`
-   - Persist them with `appendCustomMessageEntry(..., display:false)`
-   - Render them through a dedicated custom message renderer
-   - Default presentation is a stored custom message entry rendered inline in transcript/TUI flow
-   - Entry granularity is **one durable rendered entry per `HookRunRecord`**, with event-level detail nested inside that entry rather than emitted as a second event stream
-   - Phase 1 default delivery is to write the durable operator-log entry at run finalization
-   - Phase 2 may add runtime delivery via `pi.sendMessage(..., { deliverAs: "steer" })` if earlier in-turn visibility is needed
+   - Keep a durable operator-visible custom-message seam available for operator-meaningful output that should not supersede
+   - In the current implementation, this seam is used for helper-script `PI_HOOK_MSG:` output (see ADR 0005, corrected by ADR 0006), not for routine per-run `HookRunRecord` completion summaries
+   - Render durable entries through a dedicated custom message renderer
+   - Default presentation is an inline-rendered custom message in transcript/TUI flow when the message is intentionally delivered live
+   - Routine `HookRunRecord` completion remains internal runtime state rather than a visible durable transcript entry
 
 3. **Status/progress seam**
    - Add a lightweight in-flight status surface for current hook activity
@@ -118,7 +116,7 @@ The reference repo distinguishes:
 
 ### Why add status separately?
 
-In-flight state is not the same thing as durable history. A running-count/footer seam answers “what is happening now?” while the durable operator log answers “what happened for this hook run?”
+In-flight state is not the same thing as durable operator-visible output. A running-count/footer seam answers “what is happening now?” while the durable operator log answers “what operator-meaningful output should persist without supersession?”
 
 ## Initial implementation direction
 
@@ -129,7 +127,7 @@ Start with the smallest reversal that matches the reference pattern.
 Add dedicated seams alongside existing notifications:
 
 - keep notify for the existing `#25` Slice B event set
-- add a durable operator-log adapter that writes one rendered entry per `HookRunRecord` at finalization
+- keep a durable operator-log seam available for operator-meaningful persisted output, while leaving routine `HookRunRecord` completion silent by default
 - add a minimal aggregate status adapter via `ctx.ui.setStatus(...)`
 
 Use direct calls from the runtime sites that already own these concerns.
@@ -163,17 +161,16 @@ A bus is explicitly deferred; it is not required for the first slice.
 
 ## Implementation notes
 
-- Prefer `HookRunRecord` as the key for durable operator-log entries
 - Keep `appendCustomEntry(...)` reserved for internal state/bookkeeping, not operator-visible log content
-- Prefer `appendCustomMessageEntry(...)` plus a renderer for durable operator-visible history
-- In Phase 1, write durable operator-log entries at finalization rather than adding steer delivery immediately
+- Prefer live-delivered durable `custom_message` entries plus a renderer for operator-visible persisted history when that seam is used (see ADR 0006)
+- Do not emit routine `HookRunRecord` completion summaries solely to create durable transcript history
 - Use `ctx.ui.setStatus(...)` first for aggregate running state; richer widget detail can follow later if justified
 
 ## Implementation follow-ups
 
 - Confirm whether the durable operator-log renderer should remain inline in transcript flow or later move to a dedicated panel/secondary surface
-- Define the exact per-event routing table, with the default rule: keep the existing `#25` Slice B notify set and route all other operational output off the notify seam
-- Sequence the migration so finalization-time durable operator-log entries and `ctx.ui.setStatus(...)` land before any optional Phase 2 steer/widget work
+- Define the exact per-event routing table, with the default rule: keep the existing `#25` Slice B notify set and use the durable seam only for output that genuinely benefits from persistence
+- Sequence the migration so `ctx.ui.setStatus(...)` and any justified durable operator-log entries land before any optional Phase 2 steer/widget work
 
 ## References
 
